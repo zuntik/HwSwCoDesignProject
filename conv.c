@@ -1,4 +1,3 @@
-#include <stdio.h>
 #include "fifo.h"
 
 #define IWIDTH  28
@@ -18,7 +17,7 @@ volatile int *image_conv;
 #define IMAGECONV(I,J) (image_conv[(I)*CONVWIDTH+(J)])
 
 // the image to be used should go from 1 to 100
-#define IMAGE_TO_USE 3
+#define IMAGE_TO_USE 1
 
 #define FILE_START_ADDRESS 0x100000
 #define IMAGE_IN_START_ADDRESS (FILE_START_ADDRESS+16+(IMAGE_TO_USE-1)*IWIDTH*IHEIGHT)
@@ -118,20 +117,39 @@ void print_pgm_out(int invert, int saturate)
 int main()
 {
 
+	int nwords;
+
     image_in = (char*)(IMAGE_IN_START_ADDRESS);
     image_out = (int *)(IMAGE_OUT_START_ADDRESS);
     image_conv = (int *)(IMAGE_CONV_START_ADDRESS);
 
-    print_pgm_in(0);
+
+    //print_pgm_in(0);
     //convolution_2D();
     //print_pgm_out(0, 0);
 
     create_matrix();
     //print_pgm_out(0, 0);
 
-    mat_vec();
+
+
+
+    my_axis_fifo_init();
+
+
+    printf("hi\n");
+	nwords = my_send_to_fifo((void *) kernel, K_SIZE*K_SIZE);
+	printf("%d\n",nwords);
+	nwords = my_send_to_fifo((void *) image_conv, CONVHEIGHT*CONVWIDTH );
+	printf("%d\n",nwords);
+	nwords = my_receive_from_fifo((void *) image_out, OWIDTH*OHEIGHT);
+	printf("%d\n",nwords);
+
+
+    //mat_vec();
+
     print_pgm_out(0, 0);
 
-    printf("ola\n");
+    printf("adeus\n");
     return 0;
 }
