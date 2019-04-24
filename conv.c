@@ -11,9 +11,10 @@ volatile int *image_out;
 #define IMAGEOUT(I,J) (image_out[(I)*OWIDTH+(J)])
 #define WEIGHTS(I,J) (kernel[(I)*K_SIZE+(J)])
 
-#define CONVHEIGHT (OWIDTH * OHEIGHT)
-#define CONVWIDTH (K_SIZE * K_SIZE)
-volatile int *image_conv;
+#define CONVHEIGHT (OWIDTH * OHEIGHT) 
+#define PADDING_SIZE (4-(K_SIZE*K_SIZE)%4)%4
+#define CONVWIDTH (K_SIZE * K_SIZE) + PADDING_SIZE
+volatile char *image_conv;
 #define IMAGECONV(I,J) (image_conv[(I)*CONVWIDTH+(J)])
 
 // the image to be used should go from 1 to 100
@@ -23,7 +24,7 @@ volatile int *image_conv;
 #define IMAGE_IN_START_ADDRESS (FILE_START_ADDRESS+16+(IMAGE_TO_USE-1)*IWIDTH*IHEIGHT)
 
 #define IMAGE_OUT_START_ADDRESS (FILE_START_ADDRESS+16+100*IWIDTH*IHEIGHT)
-#define IMAGE_CONV_START_ADDRESS (IMAGE_OUT_START_ADDRESS+4*OWIDTH*OHEIGHT)
+#define IMAGE_CONV_START_ADDRESS (IMAGE_OUT_START_ADDRESS+OWIDTH*OHEIGHT)
 
 #define KERNEL 0
 
@@ -57,6 +58,13 @@ void create_matrix(){
             }
         }
     }
+
+    for(i=0;i<CONVHEIGHT;i++){
+		for(j=K_SIZE*K_SIZE;j<CONVWIDTH;j++){
+			IMAGECONV(i,j) = 0;
+		}
+	}
+
 }
 
 void mat_vec() {
@@ -121,7 +129,7 @@ int main()
 
     image_in = (char*)(IMAGE_IN_START_ADDRESS);
     image_out = (int *)(IMAGE_OUT_START_ADDRESS);
-    image_conv = (int *)(IMAGE_CONV_START_ADDRESS);
+    image_conv = (char *)(IMAGE_CONV_START_ADDRESS);
 
 
     //print_pgm_in(0);
