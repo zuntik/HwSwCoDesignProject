@@ -1,4 +1,5 @@
 #include "fifo.h"
+#include "xtime_l.h"
 
 #define IWIDTH  28
 #define IHEIGHT 28
@@ -11,9 +12,10 @@ volatile int *image_out;
 #define IMAGEOUT(I,J) (image_out[(I)*OWIDTH+(J)])
 #define WEIGHTS(I,J) (kernel[(I)*K_SIZE+(J)])
 
-#define CONVHEIGHT (OWIDTH * OHEIGHT)
-#define CONVWIDTH (K_SIZE * K_SIZE)
-volatile int *image_conv;
+#define CONVHEIGHT (OWIDTH * OHEIGHT) 
+#define PADDING_SIZE (4-(K_SIZE*K_SIZE)%4)%4
+#define CONVWIDTH ((K_SIZE * K_SIZE) + PADDING_SIZE)
+volatile char *image_conv;
 #define IMAGECONV(I,J) (image_conv[(I)*CONVWIDTH+(J)])
 
 // the image to be used should go from 1 to 100
@@ -23,7 +25,7 @@ volatile int *image_conv;
 #define IMAGE_IN_START_ADDRESS (FILE_START_ADDRESS+16+(IMAGE_TO_USE-1)*IWIDTH*IHEIGHT)
 
 #define IMAGE_OUT_START_ADDRESS (FILE_START_ADDRESS+16+100*IWIDTH*IHEIGHT)
-#define IMAGE_CONV_START_ADDRESS (IMAGE_OUT_START_ADDRESS+4*OWIDTH*OHEIGHT)
+#define IMAGE_CONV_START_ADDRESS (IMAGE_OUT_START_ADDRESS+OWIDTH*OHEIGHT)
 
 #define KERNEL 0
 
@@ -57,6 +59,13 @@ void create_matrix(){
             }
         }
     }
+
+    for(i=0;i<CONVHEIGHT;i++){
+		for(j=K_SIZE*K_SIZE;j<CONVWIDTH;j++){
+			IMAGECONV(i,j) = 0;
+		}
+	}
+
 }
 
 void mat_vec() {
@@ -121,13 +130,13 @@ int main()
 
     image_in = (char*)(IMAGE_IN_START_ADDRESS);
     image_out = (int *)(IMAGE_OUT_START_ADDRESS);
-    image_conv = (int *)(IMAGE_CONV_START_ADDRESS);
-
+    image_conv = (char *)(IMAGE_CONV_START_ADDRESS);
+    XTime tStart, tEnd;
 
     //print_pgm_in(0);
     //convolution_2D();
     //print_pgm_out(0, 0);
-
+    XTime_GetTime(&tStart);
     create_matrix();
     //print_pgm_out(0, 0);
 
@@ -137,15 +146,19 @@ int main()
     my_axis_fifo_init();
 
 
-    printf("hi\n");
+   // printf("hi\n");
 	nwords = my_send_to_fifo((void *) kernel, K_SIZE*K_SIZE);
-	printf("%d\n",nwords);
-	nwords = my_send_to_fifo((void *) image_conv, CONVHEIGHT*CONVWIDTH );
-	printf("%d\n",nwords);
+//	printf("%d\n",nwords);
+//	printf("%d\n",(CONVHEIGHT*(CONVWIDTH))/4);
+	nwords = my_send_to_fifo((void *) image_conv, (CONVHEIGHT*(CONVWIDTH))/4 );
+	//printf("%d\n",nwords);
 	nwords = my_receive_from_fifo((void *) image_out, OWIDTH*OHEIGHT);
-	printf("%d\n",nwords);
+	//printf("%d\n",nwords);
 
-
+	XTime_GetTime(&tEnd);
+	printf("Output took %llu clock cycles.\n", 2*(tEnd - tStart));
+	 printf("Output took %.2f us.\n",
+	 1.0 * (tEnd - tStart) / (COUNTS_PER_SECOND/1000000));
     //mat_vec();
 
     print_pgm_out(0, 0);
