@@ -65,7 +65,7 @@ void transpose(float *C, int rows, int cols, float *CT)
 			CT[j*rows+i] = C[i*cols+j] ;
 		}
 	}
-	
+
 }
 
 // Adds bias to matrix C
@@ -134,6 +134,39 @@ void print_fp_mat(float *mat, int rows, int cols)
 
 }
 
+void first_3_layers() {
+	int i;
+	int Status;
+
+	// The 22 maps weights are stored as a 22*5*5 matrix (after the initial 22 bias values)
+	matB = fp_weights + 22;
+
+	for(i = 0; i < 22 ; i++ ){
+
+		Status = XAxiDma_SimpleTransfer(&AxiDma,(UINTPTR) matB + i*25,
+				    25, XAXIDMA_DMA_TO_DEVICE);
+		if (Status != XST_SUCCESS) { return XST_FAILURE; }
+		while (XAxiDma_Busy(&AxiDma, XAXIDMA_DMA_TO_DEVICE)) { /* Wait for Tx*/ }
+
+		Status = XAxiDma_SimpleTransfer(&AxiDma,(UINTPTR) fp_image,
+	  				24*24, XAXIDMA_DMA_TO_DEVICE);
+    if (Status != XST_SUCCESS) { return XST_FAILURE; }
+
+		Status = XAxiDma_SimpleTransfer(&AxiDma, (UINTPTR) matCpool + i*12*12,
+				    12*12, XAXIDMA_DEVICE_TO_DMA);
+
+		if (Status != XST_SUCCESS) { return XST_FAILURE; }
+		while (XAxiDma_Busy(&AxiDma,XAXIDMA_DMA_TO_DEVICE)) { /* Wait Tx */ }
+
+		while (XAxiDma_Busy(&AxiDma,XAXIDMA_DEVICE_TO_DMA)) { /* Wait Rx*/ }
+
+		forward_connected_layer_HARDWARE(i);
+
+	}
+
+}
+
+
 // Returns the position of the largest value in the 10-element input vector
 // The softmax function normalizes the input-vector to a probability distribution
 int forward_softmax_layer()
@@ -148,7 +181,7 @@ int forward_softmax_layer()
 			best = i;
 		}
 	}
-	
+
 	for(i = 0; i < n; ++i){
 		e = exp(matConnB[i] - largest);
 		sum += e;
@@ -175,7 +208,7 @@ void forward_maxpool_layer()
 
 	pin = (float *)matCbias;
 	pout = (float *)matCpool;
-	
+
 	for(k = 0; k < chan; ++k){
 		for(i = 0; i < oh; ++i) {
 			for(j = 0; j < ow; ++j) {
@@ -208,14 +241,14 @@ void forward_convolutional_layer()
 
 		// The 22 maps weights are stored as a 22*5*5 matrix (after the initial 22 bias values)
 		matB = fp_weights + 22;
-		
+
 		// Matrix B is transposed to 25*22 for multiplication
 		// You can do (1) transpose + gemm, or (2) gemmBT
 		// transpose((float *)matB, 22, 25, (float *)matBT);
 		// gemm((float *)matA, (float *)matBT, (float *)matC, 24*24, 25, 22);
 		gemmBT((float *)matA, (float *)matB, (float *)matC, 24*24, 25, 22);
-		
-		// Add bias and transpose. 
+
+		// Add bias and transpose.
 		add_bias((float *)matC, 24*24, 22, (float *)fp_weights, (float *)matCbias, 1);
 		// print_fp((float *)matCbias, 300, "Convolutional+Bias");
 		// There is no activation function
@@ -232,16 +265,16 @@ void forward_connected_layer()
 		mbias = (float *)fp_weights + 22 + 550;
 		// The 10*2880 weights are stored after the 10 bias values
 		matW = (float *)fp_weights + 22 + 550 + 10;
-		
+
 		matIN = (float *)matCpool;
 		matOUT = (float *)matConn;
 		matOutB = (float *)matConnB;
-		
+
 		// A(10*3168) * B(3168*1) -> C(10*1)
 		gemm(matW, matIN, matOUT, 10, 3168, 1);
 		// print_fp((float *)matConn, 10, "Connected");
 		// print_fp(mbias, 10, "Bias");
-			
+
 		add_bias(matOUT, 10, 1, mbias, (float *)matOutB, 0);
 		// print_fp((float *)matConnB, 10, "Connected+Bias");
 		// Output vector ConnB has 10 values, one for each digit
@@ -256,7 +289,7 @@ int predict_mnist()
 {
 	int best;
 	double *ptime, *measure_time();
-	
+
 	measure_time(0);
 	forward_convolutional_layer();
 	measure_time(1);
@@ -282,12 +315,12 @@ void define_memory_regions()
 	// Region Size NIMAGES*IMAGE_HEIGTH*IMAGE_WIDTH+16 = 78416 Bytes (100 images)
 	ch_images = (unsigned char *)MEM_IMAGES_BASE_ADDRESS;
 	// Region Size TOTAL_WEIGTHS*sizeof(float) = 29330*4 = 117320 Bytes
-	fp_weights = (volatile float *)MEM_WEIGTHS_BASE_ADDRESS; 
-	 
+	fp_weights = (volatile float *)MEM_WEIGTHS_BASE_ADDRESS;
+
 	// Region Size IMAGE_HEIGTH*IMAGE_WIDTH*sizeof(float) = 28*28*4 = 3136 Bytes
 	fp_image = paddress;
 	paddress += 28*28;
- 
+
 	// Aux matrix of (24*24)*(25) elements. Region Size = 14400 * 4 = 57600 Bytes
 	matA = paddress;
 	paddress += (24*24)*(25);
@@ -331,7 +364,7 @@ void define_memory_regions()
 double *measure_time(int count)
 {
 	static double timetab[5];
-	
+
 #if EMBEDDED == 1
 	static XTime t[5];
 	XTime_GetTime(&(t[count]));
@@ -352,7 +385,7 @@ void upload_images_and_weights(void *pim, void *pwe, int size_im, int size_we)
 {
 	char header[16];
 	FILE *fimages, *fweights;
-	
+
 	// Open images file
 	if ((fimages = fopen("t100-images-idx3-ubyte", "r+")) == NULL) {
 		fprintf(stderr, "unable to open file <t100-images-idx3-ubyte>\n");
@@ -377,14 +410,14 @@ int main(int argc, char **argv){
 
 	unsigned int image_to_classify = 1; //default
 	int prediction;
-	
+
 	define_memory_regions();
-	
+
 #if EMBEDDED == 0
-	upload_images_and_weights((void *)ch_images, (void *)fp_weights, 
+	upload_images_and_weights((void *)ch_images, (void *)fp_weights,
 					16+NIMAGES*IMAGE_HEIGTH*IMAGE_WIDTH, TOTAL_WEIGTHS); // Only used for PC execution
 #endif
-	
+
 	for (image_to_classify = IMAGE_TO_CLASSIFY;
 			image_to_classify < (IMAGE_TO_CLASSIFY+NUMBER_OF_IMAGES_TO_CLASSIFY);
 			image_to_classify++) {
