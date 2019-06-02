@@ -4,6 +4,9 @@
 #include "image.h"
 #include "simple_cnn.h"
 
+#include "xaxidma.h"
+#include "xparameters.h"
+
 volatile unsigned char *ch_images;  // Images data region
 volatile float *fp_weights; // Network weights data region
 
@@ -20,6 +23,51 @@ volatile float *matCpool; // Output of pooling layer 22 images of size 12*12
 volatile float *matConn;  // Intermediate output (before adding bias) of fully connected layer (10 elements)
 volatile float *matConnB; // Output of fully connected layer (10 elements)
 volatile float *matSoftM; // Output of softmax layer (10 elements)
+volatile float *subMatrixW;
+volatile float *matW;
+volatile float *auxC;
+#define MATW(I,J,N2) (matW[(I)*N2+(J)])
+XAxiDma AxiDma[2];
+
+#define DMA_DEV_ID0		XPAR_AXIDMA_0_DEVICE_ID
+#define DMA_DEV_ID1		XPAR_AXIDMA_1_DEVICE_ID
+
+
+
+
+
+
+
+int init_XAxiDma_SimplePollMode(u16 DeviceId,int n)
+{
+  XAxiDma_Config *CfgPtr;
+  int Status;
+
+  /* Initialize the XAxiDma device.	 */
+  CfgPtr = XAxiDma_LookupConfig(DeviceId);
+  if (!CfgPtr) {
+    printf("No config found for %d\r\n", DeviceId);
+    return XST_FAILURE;
+  }
+
+  Status = XAxiDma_CfgInitialize(&AxiDma[n], CfgPtr);
+  if (Status != XST_SUCCESS) {
+    printf("Initialization failed %d\r\n", Status);
+    return XST_FAILURE;
+  }
+
+  if(XAxiDma_HasSg(&AxiDma[n])){
+    printf("Device configured as SG mode-%d \r\n",n);
+    return XST_FAILURE;
+  }
+
+  /* Disable interrupts, we use polling mode	 */
+  XAxiDma_IntrDisable(&AxiDma[n], XAXIDMA_IRQ_ALL_MASK, XAXIDMA_DEVICE_TO_DMA);
+  XAxiDma_IntrDisable(&AxiDma[n], XAXIDMA_IRQ_ALL_MASK, XAXIDMA_DMA_TO_DEVICE);
+
+  return XST_SUCCESS;
+}
+
 
 // Matrix multiplication: C = A * B
 void gemm(float *A, float *B, float *C, int rowsA, int colsA, int colsB)
@@ -35,7 +83,6 @@ void gemm(float *A, float *B, float *C, int rowsA, int colsA, int colsB)
 		}
 	}
 }
-
 // Matrix multiplication: C = A * transposed(B)
 void gemmBT(float *A, float *B, float *C, int rowsA, int colsA, int rowsB)
 {
@@ -53,8 +100,6 @@ void gemmBT(float *A, float *B, float *C, int rowsA, int colsA, int rowsB)
 		}
 	}
 }
-
-
 // Transposes matrix
 void transpose(float *C, int rows, int cols, float *CT)
 {
@@ -134,37 +179,49 @@ void print_fp_mat(float *mat, int rows, int cols)
 
 }
 
-void first_3_layers() {
-	int i;
-	int Status;
+void forward_connected_layer_HARDWARE(int i)
+{
+float* matW = (float *)fp_weights + 22 + 550 + 10;
+int Status;
+float* sub;
+float* TxBufferPtr;
+Xil_DCacheFlushRange((INTPTR)(matW), (unsigned)(12*12*22*10*4));
+Xil_DCacheFlushRange((INTPTR)(matCpool), (unsigned)(12*12*22*4));
+//for(int z=0;z<10;z++) {
+	//for(int y=0;y<12*12;y++)
+	//{
+	//subMatrixW[x*12*12+y]=MATW(x,y+(12*12)*i,12*12*22*10);
+	//subMatrixW[x*12*12+y]=matW[x*12*12*22+y+(12*12)*i];
+	//}
+		// send column of B
+printf("1\n");
+	    Status = XAxiDma_SimpleTransfer(&AxiDma[0],(UINTPTR) matCpool,
+					    22*12*12*sizeof(float), XAXIDMA_DMA_TO_DEVICE);
+	    if (Status != XST_SUCCESS) { return XST_FAILURE; }
+	    while (XAxiDma_Busy(&AxiDma[0], XAXIDMA_DMA_TO_DEVICE)) { /* Wait for Tx*/ }
+	    printf("2\n");
+	    // receive column of C
+	    TxBufferPtr = (float *)matConn;
+	    Status = XAxiDma_SimpleTransfer(&AxiDma[0],(UINTPTR)TxBufferPtr,
+					    sizeof(float), XAXIDMA_DEVICE_TO_DMA);
+	    if (Status != XST_SUCCESS) { return XST_FAILURE; }
 
-	// The 22 maps weights are stored as a 22*5*5 matrix (after the initial 22 bias values)
-	matB = fp_weights + 22;
+	    printf("3\n");
+	    // send full matrix A
+		sub=(float*)matW;
+	    Status = XAxiDma_SimpleTransfer(&AxiDma[0],(UINTPTR) sub,
+	    		10*22*12*12*sizeof(float), XAXIDMA_DMA_TO_DEVICE);
+	    if (Status != XST_SUCCESS) { return XST_FAILURE; }
+	    while (XAxiDma_Busy(&AxiDma[0],XAXIDMA_DMA_TO_DEVICE)) { /* Wait Tx */ }
 
-	for(i = 0; i < 22 ; i++ ){
+	    while (XAxiDma_Busy(&AxiDma[0],XAXIDMA_DEVICE_TO_DMA)) { /* Wait Rx*/ }
+//}
+Xil_DCacheFlushRange((INTPTR)(matConn), (unsigned)(10*4));
 
-		Status = XAxiDma_SimpleTransfer(&AxiDma,(UINTPTR) matB + i*25,
-				    25, XAXIDMA_DMA_TO_DEVICE);
-		if (Status != XST_SUCCESS) { return XST_FAILURE; }
-		while (XAxiDma_Busy(&AxiDma, XAXIDMA_DMA_TO_DEVICE)) { /* Wait for Tx*/ }
 
-		Status = XAxiDma_SimpleTransfer(&AxiDma,(UINTPTR) fp_image,
-	  				24*24, XAXIDMA_DMA_TO_DEVICE);
-    if (Status != XST_SUCCESS) { return XST_FAILURE; }
-
-		Status = XAxiDma_SimpleTransfer(&AxiDma, (UINTPTR) matCpool + i*12*12,
-				    12*12, XAXIDMA_DEVICE_TO_DMA);
-
-		if (Status != XST_SUCCESS) { return XST_FAILURE; }
-		while (XAxiDma_Busy(&AxiDma,XAXIDMA_DMA_TO_DEVICE)) { /* Wait Tx */ }
-
-		while (XAxiDma_Busy(&AxiDma,XAXIDMA_DEVICE_TO_DMA)) { /* Wait Rx*/ }
-
-		forward_connected_layer_HARDWARE(i);
-
-	}
 
 }
+
 
 
 // Returns the position of the largest value in the 10-element input vector
@@ -199,7 +256,7 @@ int forward_softmax_layer()
 // computing the maximum value for each 2*2 input region.
 void forward_maxpool_layer()
 {
-	int i, j, k, n, m, row, col, index;
+	int i, j, k, n, m1, row, col, index;
 	int size=2, stride=2;
 	int oh=12, ow=12;
 	int ih=24, iw=24, chan=22;
@@ -210,13 +267,14 @@ void forward_maxpool_layer()
 	pout = (float *)matCpool;
 
 	for(k = 0; k < chan; ++k){
+
 		for(i = 0; i < oh; ++i) {
 			for(j = 0; j < ow; ++j) {
 	max = -FLT_MAX;
-	for(n = 0; n < size; ++n){
-		for(m = 0; m < size; ++m){
+	for(n = 0; n < size; n++){
+		for(m1 = 0; m1 < size; m1++){
 			row = i*stride + n;
-			col = j*stride + m;
+			col = j*stride + m1;
 			index = col + iw * (row + ih * k);
 			val = pin[index] ;
 			max = (val > max) ? val : max;
@@ -226,6 +284,37 @@ void forward_maxpool_layer()
 			}
 		}
 	}
+	// print_fp((float *)matCpool, 120, "Pool");
+	// Output matrix Cpool is 22*144, that is this layer outputs 22 12*12 images.
+}
+
+void forward_maxpool_layer_2(int k)
+{
+	int i, j, n, m1, row, col, index;
+	int size=2, stride=2;
+	int oh=12, ow=12;
+	int ih=24, iw=24, chan=22;
+	float max = -FLT_MAX, val;
+	float *pout, *pin;
+
+	pin = (float *)matCbias;
+	pout = (float *)matCpool;
+
+		for(i = 0; i < oh; ++i) {
+			for(j = 0; j < ow; ++j) {
+	max = -FLT_MAX;
+	for(n = 0; n < size; n++){
+		for(m1 = 0; m1 < size; m1++){
+			row = i*stride + n;
+			col = j*stride + m1;
+			index = col + iw * (row + ih * k);
+			val = pin[index] ;
+			max = (val > max) ? val : max;
+		}
+	}
+	pout[j + ow * (i + oh * k)] = max;
+			}
+		}
 	// print_fp((float *)matCpool, 120, "Pool");
 	// Output matrix Cpool is 22*144, that is this layer outputs 22 12*12 images.
 }
@@ -275,10 +364,81 @@ void forward_connected_layer()
 		// print_fp((float *)matConn, 10, "Connected");
 		// print_fp(mbias, 10, "Bias");
 
+		for(int l=0;l<10;l++)
+					printf("out[%d]:%f\n",l,matConn[l]);
 		add_bias(matOUT, 10, 1, mbias, (float *)matOutB, 0);
 		// print_fp((float *)matConnB, 10, "Connected+Bias");
 		// Output vector ConnB has 10 values, one for each digit
 }
+
+
+int first_3_layers() {
+	int i;
+	int Status;
+	float *TxBufferPtr;
+	// The 22 maps weights are stored as a 22*5*5 matrix (after the initial 22 bias values)
+	matB = fp_weights + 22;
+
+	Xil_DCacheFlushRange((INTPTR)(matB), (unsigned)(25*4));
+	Xil_DCacheFlushRange((INTPTR)(fp_image), (unsigned)(28*28*4));
+
+	for(int z=0;z<10;z++)
+		matConn[z]=0;
+prepare_matrixA();
+forward_convolutional_layer();
+forward_maxpool_layer();
+//for(i = 0; i < 22 ; i++ ){
+/*
+
+
+
+		TxBufferPtr = (float *)matB + (i*25);
+		Status = XAxiDma_SimpleTransfer(&AxiDma[0],(UINTPTR) TxBufferPtr,
+				    25*sizeof(float), XAXIDMA_DMA_TO_DEVICE);
+		if (Status != XST_SUCCESS) { return XST_FAILURE; };
+
+		while (XAxiDma_Busy(&AxiDma[0], XAXIDMA_DMA_TO_DEVICE)) { }
+
+		TxBufferPtr = (float *)matCpool + (i*12*12);
+		Status = XAxiDma_SimpleTransfer(&AxiDma[0], (UINTPTR) TxBufferPtr,
+				    12*12*sizeof(float), XAXIDMA_DEVICE_TO_DMA);
+		if (Status != XST_SUCCESS) { return XST_FAILURE; }
+
+
+
+		Status = XAxiDma_SimpleTransfer(&AxiDma[0],(UINTPTR) fp_image,
+	  				28*28*sizeof(float), XAXIDMA_DMA_TO_DEVICE);
+    	if (Status != XST_SUCCESS) { return XST_FAILURE; }
+
+
+		while (XAxiDma_Busy(&AxiDma[0],XAXIDMA_DMA_TO_DEVICE)) {  }
+		while (XAxiDma_Busy(&AxiDma[0],XAXIDMA_DEVICE_TO_DMA)) { }
+
+
+		  Xil_DCacheInvalidateRange((INTPTR)(TxBufferPtr), (unsigned)(4*12*12));
+
+		if(i==21)
+		for(int i=0;i<12*12;i++)
+		{
+		if(matCpool[i]!=0)
+		printf("matCpool[%d]:%f \n",i,matCpool[i]);
+		}
+	*/
+		forward_connected_layer_HARDWARE(i);
+
+			for(int l=0;l<10;l++)
+			printf("out[%d]:%f\n",l,matConn[l]);
+
+	float* mbias = (float *)fp_weights + 22 + 550;
+	float* in=(float*)matConn;
+	float* out=(float*)matConnB;
+	add_bias(in, 10, 1, mbias, (float *)out, 0);
+	/*for(int z=0;z<10;z++)
+		printf("out[%d]:%f",z,out[z]);*/
+	return 0;
+
+}
+
 
 // Digit classification is performed using 4 layers:
 // 1. Convolutional layer
@@ -288,8 +448,9 @@ void forward_connected_layer()
 int predict_mnist()
 {
 	int best;
+	int stat;
 	double *ptime, *measure_time();
-
+if (SOFTWARE==1){
 	measure_time(0);
 	forward_convolutional_layer();
 	measure_time(1);
@@ -299,12 +460,30 @@ int predict_mnist()
 	measure_time(3);
 	best = forward_softmax_layer();
 	ptime = measure_time(4);
+
 #if PRINT_TIME_PER_LAYER
 	printf("Layer 1 (Convolutional) took %.0f us.\n", ptime[0]);
 	printf("Layer 2 (Pooling) took %.0f us.\n", ptime[1]);
 	printf("Layer 3 (Fully-Connected) took %.0f us.\n", ptime[2]);
 	printf("Layer 4 (Soft-max) took %.0f us.\n", 1.0 * ptime[3]);
 #endif
+}
+else
+{ //hardware
+init_XAxiDma_SimplePollMode(DMA_DEV_ID0,0);
+init_XAxiDma_SimplePollMode(DMA_DEV_ID1,1);
+measure_time(0);
+stat=first_3_layers();
+measure_time(1);
+best = forward_softmax_layer();
+ptime=measure_time(2);
+printf("STATUS=%d",stat);
+#if PRINT_TIME_PER_LAYER
+	printf("Layer 1-2-3-4 Hardware took %.0f us.\n", ptime[0]);
+	printf("Software Layer took %0.f us .\n",ptime[1]);
+#endif
+}
+
 	return best;
 }
 
@@ -353,6 +532,10 @@ void define_memory_regions()
 	paddress += 10;
 	// Aux matrix of 10 elements. Region Size = 10 * 4 Bytes
 	matSoftM = paddress;
+	paddress +=10;
+	subMatrixW = paddress;
+	paddress+=12*12*10;
+	auxC=paddress;
 
 	// printf("%p, %d\n", (void *)paddress+10, (paddress+10)-(float *)MEM_DATA_BASE_ADDRESS);
 	// Total data region size is 71898 * 4 = 287,592 Bytes

@@ -36,7 +36,7 @@ void axis_fixed_macc(
    static datai_t localmem[512];
    int i;
 
-   for (i=0; i<512; i++) {
+   for (i=0; i<512*7; i++) {
 	   tmp = strm_in.read();
 	   localmem[i] = tmp.data;
 	   if (tmp.last == 1) break ;
@@ -46,7 +46,7 @@ void axis_fixed_macc(
    for (; ; ) {
 #pragma HLS loop_flatten off
 	   acc = 0.0;
-	   for (i=0; i<512; i++) {
+	   for (i=0; i<512*7; i++) {
 #pragma HLS pipeline
 		   tmp = strm_in.read();
 		   op1 = (op_t)(localmem[i]);

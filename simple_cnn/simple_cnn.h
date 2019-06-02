@@ -1,4 +1,5 @@
-#define EMBEDDED 0
+#define EMBEDDED 1
+#define SOFTWARE 0
 
 #define TOTAL_WEIGTHS (22+22*5*5+10+10*22*12*12)
 #define FLT_MAX 3.402823466e+38F
