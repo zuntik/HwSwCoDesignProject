@@ -29,6 +29,7 @@ XAxiDma AxiDma[4];
 volatile int *sync_f = (int *)0xFFFFFC00;
 #endif
 
+volatile float *sum1, *sum2;
 
 volatile unsigned char *ch_images;  // Images data region
 volatile float *fp_weights; // Network weights data region
@@ -52,7 +53,7 @@ volatile float *aux; // Auxiliary array for
 
 
 #if USEHARDWARE
-int init_XAxiDma_SimplePollMode(u16 DeviceId)
+int init_XAxiDma_SimplePollMode(u16 DeviceId, int i)
 {
   XAxiDma_Config *CfgPtr;
   int Status;
@@ -64,20 +65,20 @@ int init_XAxiDma_SimplePollMode(u16 DeviceId)
     return XST_FAILURE;
   }
 
-  Status = XAxiDma_CfgInitialize(&AxiDma, CfgPtr);
+  Status = XAxiDma_CfgInitialize(&AxiDma[i], CfgPtr);
   if (Status != XST_SUCCESS) {
     printf("Initialization failed %d\r\n", Status);
     return XST_FAILURE;
   }
 
-  if(XAxiDma_HasSg(&AxiDma)){
+  if(XAxiDma_HasSg(&AxiDma[i])){
     printf("Device configured as SG mode \r\n");
     return XST_FAILURE;
   }
 
   /* Disable interrupts, we use polling mode	 */
-  XAxiDma_IntrDisable(&AxiDma, XAXIDMA_IRQ_ALL_MASK, XAXIDMA_DEVICE_TO_DMA);
-  XAxiDma_IntrDisable(&AxiDma, XAXIDMA_IRQ_ALL_MASK, XAXIDMA_DMA_TO_DEVICE);
+  XAxiDma_IntrDisable(&AxiDma[i], XAXIDMA_IRQ_ALL_MASK, XAXIDMA_DEVICE_TO_DMA);
+  XAxiDma_IntrDisable(&AxiDma[i], XAXIDMA_IRQ_ALL_MASK, XAXIDMA_DMA_TO_DEVICE);
 
   return XST_SUCCESS;
 }
@@ -265,38 +266,41 @@ int forward_softmax_layer()
 
 int forward_softmax_layer2()
 {
-	int i, n=10, best=-1;
-	float sum1 = 0.0, sum2 = 0.0, sum, e;
+	int i, best=-1;
+	float sum, e;
 	float largest = -FLT_MAX;
 
     // Finding the biggest element should be done by core 1
-	for(i = 0; i < n; ++i){
+	for(i = 0; i < 10; ++i){
 		if(matConnB[i] > largest) {
 			largest = matConnB[i];
 			best = i;
 		}
 	}
 	
+    *sum1 = 0;
+    *sum2 = 0;
     // only the exponentiation should be distributed
     
     // place in core 1
 	for(i = 0; i < 5; ++i){
 		e = exp(matConnB[i]);
-		sum1 += e;
+		*sum1 += e;
 		matSoftM[i] = e;
 	}
 
+    printf("here\n");
     // TODO: place in core 2
-	for(i = 5; i < n; ++i){
+	for(i = 5; i < 10; ++i){
 		e = exp(matConnB[i]);
-		sum2 += e;
+		*sum2 += e;
 		matSoftM[i] = e;
 	}
 
 
     // done by core 1
-    sum = sum1 + sum2;
-	for(i = 0; i < n; ++i){
+    sum = *sum1 + *sum2;
+	for(i = 0; i < 10; ++i){
 		matSoftM[i] /= sum;
 	}
 
@@ -308,12 +312,12 @@ int forward_softmax_layer2()
 #if USEDUALCORE
 int forward_softmax_layer_2core()
 {
-	int i, n=10, best=-1;
-	float sum1 = 0.0, sum2 = 0.0, sum, e;
+	int i, best=-1;
+	float sum, e;
 	float largest = -FLT_MAX;
 
     // Finding the biggest element should be done by core 1
-	for(i = 0; i < n; ++i){
+	for(i = 0; i < 10; ++i){
 		if(matConnB[i] > largest) {
 			largest = matConnB[i];
 			best = i;
@@ -325,13 +329,13 @@ int forward_softmax_layer_2core()
     // place in core 1
 	for(i = 0; i < 5; ++i){
 		e = exp(matConnB[i]);
-		sum1 += e;
+		*sum1 += e;
 		matSoftM[i] = e;
 	}
 
     // done by core 1
-    sum = sum1 + sum2;
-	for(i = 0; i < n; ++i){
+    sum = *sum1 + *sum2;
+	for(i = 0; i < 10; ++i){
 		matSoftM[i] /= sum;
 	}
 
@@ -473,73 +477,73 @@ void forward_maxpool_layer_2core()
 // Each feature map has a set of 5*5 weights and a single bias.
 void forward_convolutional_layer()
 {
-		// Matrix A is prepared (with 24*24=576 rows and 5*5=25 columns)
-		// in order to do the convolutions as a matrix multiplication
-		// such that, A(576*25) * BT(25*22) -> C(576*22)
-		prepare_matrixA();
+    // Matrix A is prepared (with 24*24=576 rows and 5*5=25 columns)
+    // in order to do the convolutions as a matrix multiplication
+    // such that, A(576*25) * BT(25*22) -> C(576*22)
+    prepare_matrixA();
 
-		// The 22 maps weights are stored as a 22*5*5 matrix (after the initial 22 bias values)
-		matB = fp_weights + 22;
-		
-		// Matrix B is transposed to 25*22 for multiplication
-		// You can do (1) transpose + gemm, or (2) gemmBT
-		// transpose((float *)matB, 22, 25, (float *)matBT);
-		// gemm((float *)matA, (float *)matBT, (float *)matC, 24*24, 25, 22);
-		gemmBT((float *)matA, (float *)matB, (float *)matC, 24*24, 25, 22);
-		
-		// Add bias and transpose. 
-		add_bias((float *)matC, 24*24, 22, (float *)fp_weights, (float *)matCbias, 1);
-		// print_fp((float *)matCbias, 300, "Convolutional+Bias");
-		// There is no activation function
-		// Output matrix Cbias is 22*576, that is this layer outputs 22 24*24 images.
+    // The 22 maps weights are stored as a 22*5*5 matrix (after the initial 22 bias values)
+    matB = fp_weights + 22;
+    
+    // Matrix B is transposed to 25*22 for multiplication
+    // You can do (1) transpose + gemm, or (2) gemmBT
+    // transpose((float *)matB, 22, 25, (float *)matBT);
+    // gemm((float *)matA, (float *)matBT, (float *)matC, 24*24, 25, 22);
+    gemmBT((float *)matA, (float *)matB, (float *)matC, 24*24, 25, 22);
+    
+    // Add bias and transpose. 
+    add_bias((float *)matC, 24*24, 22, (float *)fp_weights, (float *)matCbias, 1);
+    // print_fp((float *)matCbias, 300, "Convolutional+Bias");
+    // There is no activation function
+    // Output matrix Cbias is 22*576, that is this layer outputs 22 24*24 images.
 }
 
 void forward_convolutional_layer2()
 {
-        int k;
-        float *auxIn, *auxOut;
-        float auxMatC[24*24*22]={0};
+    int k;
+    float *auxIn, *auxOut;
+    float auxMatC[24*24*22]={0};
 
-		// The 22 maps weights are stored as a 22*5*5 matrix (after the initial 22 bias values)
-		matB = fp_weights + 22;
-		
-        /*
-		for( k=0; k<22; k++ ) {
-            auxIn = (float *) matB + k*25;
-            auxOut = (float *) auxMatC + k*576;
-            gemm((float *)matA, auxIn, auxOut, 576, 25, 1);
-        }
-        */
-
-		for( int i=0; i<5; i++ ) {
-            auxIn = (float *) matB + (i*4)*25;
-            auxOut = (float *) auxMatC + (i*4)*576;
-            gemm((float *)matA, auxIn, auxOut, 576, 25, 1);
-            auxIn = (float *) matB + (i*4+1)*25;
-            auxOut = (float *) auxMatC + (i*4+1)*576;
-            gemm((float *)matA, auxIn, auxOut, 576, 25, 1);
-            auxIn = (float *) matB + (i*4+2)*25;
-            auxOut = (float *) auxMatC + (i*4+2)*576;
-            gemm((float *)matA, auxIn, auxOut, 576, 25, 1);
-            auxIn = (float *) matB + (i*4+3)*25;
-            auxOut = (float *) auxMatC + (i*4+3)*576;
-            gemm((float *)matA, auxIn, auxOut, 576, 25, 1);
-        }
-
-        auxIn = (float *) matB + (20)*25;
-        auxOut = (float *) auxMatC + (20)*576;
+    // The 22 maps weights are stored as a 22*5*5 matrix (after the initial 22 bias values)
+    matB = fp_weights + 22;
+    
+    /*
+    for( k=0; k<22; k++ ) {
+        auxIn = (float *) matB + k*25;
+        auxOut = (float *) auxMatC + k*576;
         gemm((float *)matA, auxIn, auxOut, 576, 25, 1);
-        auxIn = (float *) matB + (21)*25;
-        auxOut = (float *) auxMatC + (21)*576;
+    }
+    */
+
+    for( int i=0; i<5; i++ ) {
+        auxIn = (float *) matB + (i*4)*25;
+        auxOut = (float *) auxMatC + (i*4)*576;
         gemm((float *)matA, auxIn, auxOut, 576, 25, 1);
+        auxIn = (float *) matB + (i*4+1)*25;
+        auxOut = (float *) auxMatC + (i*4+1)*576;
+        gemm((float *)matA, auxIn, auxOut, 576, 25, 1);
+        auxIn = (float *) matB + (i*4+2)*25;
+        auxOut = (float *) auxMatC + (i*4+2)*576;
+        gemm((float *)matA, auxIn, auxOut, 576, 25, 1);
+        auxIn = (float *) matB + (i*4+3)*25;
+        auxOut = (float *) auxMatC + (i*4+3)*576;
+        gemm((float *)matA, auxIn, auxOut, 576, 25, 1);
+    }
 
-        transpose(auxMatC,  22, 576 , (float *)matC);
+    auxIn = (float *) matB + (20)*25;
+    auxOut = (float *) auxMatC + (20)*576;
+    gemm((float *)matA, auxIn, auxOut, 576, 25, 1);
+    auxIn = (float *) matB + (21)*25;
+    auxOut = (float *) auxMatC + (21)*576;
+    gemm((float *)matA, auxIn, auxOut, 576, 25, 1);
 
-		// Add bias and transpose. 
-		add_bias((float *)matC, 24*24, 22, (float *)fp_weights, (float *)matCbias, 1);
-		// print_fp((float *)matCbias, 300, "Convolutional+Bias");
-		// There is no activation function
-		// Output matrix Cbias is 22*576, that is this layer outputs 22 24*24 images.
+    transpose(auxMatC,  22, 576 , (float *)matC);
+
+    // Add bias and transpose. 
+    add_bias((float *)matC, 24*24, 22, (float *)fp_weights, (float *)matCbias, 1);
+    // print_fp((float *)matCbias, 300, "Convolutional+Bias");
+    // There is no activation function
+    // Output matrix Cbias is 22*576, that is this layer outputs 22 24*24 images.
 }
 
 #if USEHARDWARE 
@@ -702,12 +706,22 @@ void forward_connected_layer2()
     for(int it = 0; it < 40; it++) aux[it] = 0;
     for(int it = 0; it < 10; it++) matOUT[it] = 0;
 
-    for(int k=0; k < 4; k++) {
-        aux2 = (float *)subMatsWeights+k*7920;
-        aux3 = (float *)matIN + k*792;
-        gemm(aux2, aux3, (float *)aux + k*10, 10, 792, 1);
-        for(int it = 0; it < 10; it++) matOUT[it] += aux[it];
-    }
+    aux2 = (float *)subMatsWeights+7920*0;
+    aux3 = (float *)matIN + 792*0;
+    gemm(aux2, aux3, (float *)aux, 10, 792, 1);
+    for(int it = 0; it < 10; it++) matOUT[it] += aux[it];
+    aux2 = (float *)subMatsWeights+7920*1;
+    aux3 = (float *)matIN + 792*1;
+    gemm(aux2, aux3, (float *)aux, 10, 792, 1);
+    for(int it = 0; it < 10; it++) matOUT[it] += aux[it];
+    aux2 = (float *)subMatsWeights+7920*2;
+    aux3 = (float *)matIN + 792*2;
+    gemm(aux2, aux3, (float *)aux, 10, 792, 1);
+    for(int it = 0; it < 10; it++) matOUT[it] += aux[it];
+    aux2 = (float *)subMatsWeights+7920*3;
+    aux3 = (float *)matIN + 792*3;
+    gemm(aux2, aux3, (float *)aux, 10, 792, 1);
+    for(int it = 0; it < 10; it++) matOUT[it] += aux[it];
     
     // A(10*3168) * B(3168*1) -> C(10*1)
     //gemm(matW, matIN, matOUT, 10, 3168, 1);
@@ -951,6 +965,12 @@ static float *paddress = (float *)MEM_DATA_BASE_ADDRESS;
     // Aux array of 40 elements. Region size = 40 * 4 Bytes
     aux = paddress;
     paddress += 40;
+    // Aux floats for sums
+    sum1 = paddress;
+    paddress += 1;
+    sum2 = paddress;
+    paddress += 1;
+
 
 	// printf("%p, %d\n", (void *)paddress+10, (paddress+10)-(float *)MEM_DATA_BASE_ADDRESS);
 	// Total data region size is 71898 * 4 = 287,592 Bytes
