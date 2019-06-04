@@ -4,6 +4,32 @@
 #include "image.h"
 #include "simple_cnn.h"
 
+#if USEHARDWARE
+#include "xaxidma.h"
+#include "xparameters.h"
+#include "xtime_l.h"
+#include "xil_cache.h"
+#define DMA_DEV_ID0		XPAR_AXIDMA_0_DEVICE_ID
+#define DMA_DEV_ID1		XPAR_AXIDMA_1_DEVICE_ID
+#define DMA_DEV_ID2		XPAR_AXIDMA_2_DEVICE_ID
+#define DMA_DEV_ID3		XPAR_AXIDMA_3_DEVICE_ID
+#endif
+
+#if USEDUALCORE
+#include "xil_mmu.h"
+#endif
+
+
+
+#if USEHARDWARE
+XAxiDma AxiDma[4];
+#endif
+
+#if USEDUALCORE
+volatile int *sync_f = (int *)0xFFFFFC00;
+#endif
+
+
 volatile unsigned char *ch_images;  // Images data region
 volatile float *fp_weights; // Network weights data region
 
@@ -21,8 +47,50 @@ volatile float *matConn;  // Intermediate output (before adding bias) of fully c
 volatile float *matConnB; // Output of fully connected layer (10 elements)
 volatile float *matSoftM; // Output of softmax layer (10 elements)
 
-
 volatile float *subMatsWeights; // Auxiliary matrix for 3rd layer
+volatile float *aux; // Auxiliary array for 
+
+
+#if USEHARDWARE
+int init_XAxiDma_SimplePollMode(u16 DeviceId)
+{
+  XAxiDma_Config *CfgPtr;
+  int Status;
+
+  /* Initialize the XAxiDma device.	 */
+  CfgPtr = XAxiDma_LookupConfig(DeviceId);
+  if (!CfgPtr) {
+    printf("No config found for %d\r\n", DeviceId);
+    return XST_FAILURE;
+  }
+
+  Status = XAxiDma_CfgInitialize(&AxiDma, CfgPtr);
+  if (Status != XST_SUCCESS) {
+    printf("Initialization failed %d\r\n", Status);
+    return XST_FAILURE;
+  }
+
+  if(XAxiDma_HasSg(&AxiDma)){
+    printf("Device configured as SG mode \r\n");
+    return XST_FAILURE;
+  }
+
+  /* Disable interrupts, we use polling mode	 */
+  XAxiDma_IntrDisable(&AxiDma, XAXIDMA_IRQ_ALL_MASK, XAXIDMA_DEVICE_TO_DMA);
+  XAxiDma_IntrDisable(&AxiDma, XAXIDMA_IRQ_ALL_MASK, XAXIDMA_DMA_TO_DEVICE);
+
+  return XST_SUCCESS;
+}
+int init_dma() {
+    int a,b,c,d;
+    a = init_XAxiDma_SimplePollMode(DMA_DEV_ID0,0);
+    b = init_XAxiDma_SimplePollMode(DMA_DEV_ID1,1);
+    c = init_XAxiDma_SimplePollMode(DMA_DEV_ID2,2);
+    d = init_XAxiDma_SimplePollMode(DMA_DEV_ID3,3);
+    return a && b && c && d;
+}
+#endif
+
 
 // Matrix multiplication: C = A * B
 void gemm(float *A, float *B, float *C, int rowsA, int colsA, int colsB)
@@ -237,6 +305,41 @@ int forward_softmax_layer2()
 	return best;
 }
 
+#if USEDUALCORE
+int forward_softmax_layer_2core()
+{
+	int i, n=10, best=-1;
+	float sum1 = 0.0, sum2 = 0.0, sum, e;
+	float largest = -FLT_MAX;
+
+    // Finding the biggest element should be done by core 1
+	for(i = 0; i < n; ++i){
+		if(matConnB[i] > largest) {
+			largest = matConnB[i];
+			best = i;
+		}
+	}
+	
+    // only the exponentiation should be distributed
+    
+    // place in core 1
+	for(i = 0; i < 5; ++i){
+		e = exp(matConnB[i]);
+		sum1 += e;
+		matSoftM[i] = e;
+	}
+
+    // done by core 1
+    sum = sum1 + sum2;
+	for(i = 0; i < n; ++i){
+		matSoftM[i] /= sum;
+	}
+
+	//print_fp((float *)matSoftM, 10, "Softmax");
+
+	return best;
+}
+#endif
 
 // The max-pool layer condenses the 24*24 images to 12*12,
 // computing the maximum value for each 2*2 input region.
@@ -328,6 +431,44 @@ void forward_maxpool_layer2()
 }
 
 
+#if USEDUALCORE 
+void forward_maxpool_layer_2core()
+{
+	int i, j, k, n, m, row, col, index;
+	int size=2, stride=2;
+	int oh=12, ow=12;
+	int ih=24, iw=24, chan=22;
+	float max = -FLT_MAX, val;
+	float *pout, *pin;
+
+	pin = (float *)matCbias;
+	pout = (float *)matCpool;
+	
+    // first half
+	for(k = 0; k < chan; ++k){
+		for(i = 0; i < oh; ++i) {
+			for(j = 0; j < ow; ++j) {
+	            max = -FLT_MAX;
+	            for(n = 0; n < size; ++n){
+		            for(m = 0; m < size; ++m){
+                        row = i*stride + n;
+                        col = j*stride + m;
+                        index = col + iw * (row + ih * k);
+                        val = pin[index] ;
+                        max = (val > max) ? val : max;
+		            }
+	            }
+	            pout[j + ow * (i + oh * k)] = max;
+			}
+		}
+	}
+
+	// print_fp((float *)matCpool, 120, "Pool");
+	// Output matrix Cpool is 22*144, that is this layer outputs 22 12*12 images.
+}
+#endif
+
+
 // The convolution layer consists of 22 feature maps.
 // Each feature map has a set of 5*5 weights and a single bias.
 void forward_convolutional_layer()
@@ -362,12 +503,35 @@ void forward_convolutional_layer2()
 		// The 22 maps weights are stored as a 22*5*5 matrix (after the initial 22 bias values)
 		matB = fp_weights + 22;
 		
+        /*
 		for( k=0; k<22; k++ ) {
             auxIn = (float *) matB + k*25;
             auxOut = (float *) auxMatC + k*576;
             gemm((float *)matA, auxIn, auxOut, 576, 25, 1);
         }
+        */
 
+		for( int i=0; i<5; i++ ) {
+            auxIn = (float *) matB + (i*4)*25;
+            auxOut = (float *) auxMatC + (i*4)*576;
+            gemm((float *)matA, auxIn, auxOut, 576, 25, 1);
+            auxIn = (float *) matB + (i*4+1)*25;
+            auxOut = (float *) auxMatC + (i*4+1)*576;
+            gemm((float *)matA, auxIn, auxOut, 576, 25, 1);
+            auxIn = (float *) matB + (i*4+2)*25;
+            auxOut = (float *) auxMatC + (i*4+2)*576;
+            gemm((float *)matA, auxIn, auxOut, 576, 25, 1);
+            auxIn = (float *) matB + (i*4+3)*25;
+            auxOut = (float *) auxMatC + (i*4+3)*576;
+            gemm((float *)matA, auxIn, auxOut, 576, 25, 1);
+        }
+
+        auxIn = (float *) matB + (20)*25;
+        auxOut = (float *) auxMatC + (20)*576;
+        gemm((float *)matA, auxIn, auxOut, 576, 25, 1);
+        auxIn = (float *) matB + (21)*25;
+        auxOut = (float *) auxMatC + (21)*576;
+        gemm((float *)matA, auxIn, auxOut, 576, 25, 1);
 
         transpose(auxMatC,  22, 576 , (float *)matC);
 
@@ -377,6 +541,123 @@ void forward_convolutional_layer2()
 		// There is no activation function
 		// Output matrix Cbias is 22*576, that is this layer outputs 22 24*24 images.
 }
+
+#if USEHARDWARE 
+void forward_convolutional_layer_HARDWARE()
+{
+    int k;
+    float *auxIn, *auxOut;
+    float auxMatC[24*24*22]={0};
+    float *TxBufferPtr, *RxBufferPtr;
+
+	// The 22 maps weights are stored as a 22*5*5 matrix (after the initial 22 bias values)
+	matB = fp_weights + 22;
+
+    Xil_DCacheFlushRange((INTPTR)(matB), (unsigned)(4*25*22));
+
+    for( int i=0; i<5; i++) {
+        TxBufferPtr = (float *) matB + (i*4)*25;
+        XAxiDma_SimpleTransfer(&AxiDma[0],(UINTPTR) TxBufferPtr,
+				    100, XAXIDMA_DMA_TO_DEVICE);
+        TxBufferPtr = (float *) matB + (i*4+1)*25;
+        XAxiDma_SimpleTransfer(&AxiDma[1],(UINTPTR) TxBufferPtr,
+				    100, XAXIDMA_DMA_TO_DEVICE);
+        TxBufferPtr = (float *) matB + (i*4+2)*25;
+        XAxiDma_SimpleTransfer(&AxiDma[2],(UINTPTR) TxBufferPtr,
+				    100, XAXIDMA_DMA_TO_DEVICE);
+        TxBufferPtr = (float *) matB + (i*4+3)*25;
+        XAxiDma_SimpleTransfer(&AxiDma[3],(UINTPTR) TxBufferPtr,
+				    100, XAXIDMA_DMA_TO_DEVICE);
+
+        /* Wait for Tx*/ 
+        while ( XAxiDma_Busy(&AxiDma[0], XAXIDMA_DMA_TO_DEVICE) ||
+                XAxiDma_Busy(&AxiDma[1], XAXIDMA_DMA_TO_DEVICE) ||
+                XAxiDma_Busy(&AxiDma[2], XAXIDMA_DMA_TO_DEVICE) ||
+                XAxiDma_Busy(&AxiDma[3], XAXIDMA_DMA_TO_DEVICE) ) {}
+
+        RxBufferPtr = (float *) auxMatC + (i*4)*576;
+        XAxiDma_SimpleTransfer(&AxiDma[0],(UINTPTR) (RxBufferPtr),
+				    24*24*25*4, XAXIDMA_DEVICE_TO_DMA);
+        RxBufferPtr = (float *) auxMatC + (i*4+1)*576;
+        XAxiDma_SimpleTransfer(&AxiDma[1],(UINTPTR) (RxBufferPtr),
+				    24*24*25*4, XAXIDMA_DEVICE_TO_DMA);
+        RxBufferPtr = (float *) auxMatC + (i*4+2)*576;
+        XAxiDma_SimpleTransfer(&AxiDma[2],(UINTPTR) (RxBufferPtr),
+				    24*24*25*4, XAXIDMA_DEVICE_TO_DMA);
+        RxBufferPtr = (float *) auxMatC + (i*4+3)*576;
+        XAxiDma_SimpleTransfer(&AxiDma[3],(UINTPTR) (RxBufferPtr),
+				    24*24*25*4, XAXIDMA_DEVICE_TO_DMA);
+
+        TxBufferPtr = (float *) matA;
+        XAxiDma_SimpleTransfer(&AxiDma[0],(UINTPTR) TxBufferPtr,
+				    24*24*25, XAXIDMA_DMA_TO_DEVICE);
+        XAxiDma_SimpleTransfer(&AxiDma[1],(UINTPTR) TxBufferPtr,
+				    24*24*25, XAXIDMA_DMA_TO_DEVICE);
+        XAxiDma_SimpleTransfer(&AxiDma[2],(UINTPTR) TxBufferPtr,
+				    24*24*25, XAXIDMA_DMA_TO_DEVICE);
+        XAxiDma_SimpleTransfer(&AxiDma[3],(UINTPTR) TxBufferPtr,
+				    24*24*25, XAXIDMA_DMA_TO_DEVICE);
+
+        /* Wait for Tx*/ 
+        while ( XAxiDma_Busy(&AxiDma[0], XAXIDMA_DMA_TO_DEVICE) ||
+                XAxiDma_Busy(&AxiDma[1], XAXIDMA_DMA_TO_DEVICE) ||
+                XAxiDma_Busy(&AxiDma[2], XAXIDMA_DMA_TO_DEVICE) ||
+                XAxiDma_Busy(&AxiDma[3], XAXIDMA_DMA_TO_DEVICE) ) {}
+
+        /* Wait for Rx*/ 
+        while ( XAxiDma_Busy(&AxiDma[0], XAXIDMA_DEVICE_TO_DMA) ||
+                XAxiDma_Busy(&AxiDma[1], XAXIDMA_DEVICE_TO_DMA) ||
+                XAxiDma_Busy(&AxiDma[2], XAXIDMA_DEVICE_TO_DMA) ||
+                XAxiDma_Busy(&AxiDma[3], XAXIDMA_DEVICE_TO_DMA) ) {}
+ 
+    }
+
+    TxBufferPtr = (float *) matB + 20*25;
+    XAxiDma_SimpleTransfer(&AxiDma[0],(UINTPTR) TxBufferPtr,
+                100, XAXIDMA_DMA_TO_DEVICE);
+    TxBufferPtr = (float *) matB + 21*25;
+    XAxiDma_SimpleTransfer(&AxiDma[1],(UINTPTR) TxBufferPtr,
+                100, XAXIDMA_DMA_TO_DEVICE);
+
+    /* Wait for Tx*/ 
+    while ( XAxiDma_Busy(&AxiDma[0], XAXIDMA_DMA_TO_DEVICE) ||
+            XAxiDma_Busy(&AxiDma[1], XAXIDMA_DMA_TO_DEVICE)) {}
+
+    RxBufferPtr = (float *) auxMatC + (20)*576;
+    XAxiDma_SimpleTransfer(&AxiDma[0],(UINTPTR) (RxBufferPtr),
+                24*24*25*4, XAXIDMA_DEVICE_TO_DMA);
+    RxBufferPtr = (float *) auxMatC + (21)*576;
+    XAxiDma_SimpleTransfer(&AxiDma[1],(UINTPTR) (RxBufferPtr),
+                24*24*25*4, XAXIDMA_DEVICE_TO_DMA);
+
+    TxBufferPtr = (float *) matA;
+    XAxiDma_SimpleTransfer(&AxiDma[0],(UINTPTR) TxBufferPtr,
+                24*24*25, XAXIDMA_DMA_TO_DEVICE);
+    XAxiDma_SimpleTransfer(&AxiDma[1],(UINTPTR) TxBufferPtr,
+                24*24*25, XAXIDMA_DMA_TO_DEVICE);
+
+    /* Wait for Tx*/ 
+    while ( XAxiDma_Busy(&AxiDma[0], XAXIDMA_DMA_TO_DEVICE) ||
+            XAxiDma_Busy(&AxiDma[1], XAXIDMA_DMA_TO_DEVICE)) {}
+    /* Wait for Rx*/ 
+    while ( XAxiDma_Busy(&AxiDma[0], XAXIDMA_DEVICE_TO_DMA) ||
+            XAxiDma_Busy(&AxiDma[1], XAXIDMA_DEVICE_TO_DMA)) {}
+
+    Xil_DCacheInvalidateRange((INTPTR)(auxMatC), (unsigned)(24*24*22));
+    
+
+    transpose(auxMatC,  22, 576 , (float *)matC);
+
+	// Add bias and transpose. 
+	add_bias((float *)matC, 24*24, 22, (float *)fp_weights, (float *)matCbias, 1);
+	// print_fp((float *)matCbias, 300, "Convolutional+Bias");
+	// There is no activation function
+	// Output matrix Cbias is 22*576, that is this layer outputs 22 24*24 images.
+    
+
+}
+#endif
+
 
 // This layer fully connects the 3168 inputs (22 12*12images),
 // to 10 output neurons (one for each digit)
@@ -405,39 +686,137 @@ void forward_connected_layer()
 
 void forward_connected_layer2()
 {
-		float *matIN, *mbias, *matOUT, *matOutB;
+    float *matIN, *mbias, *matOUT, *matOutB;
 
-		// The 10 bias values of this layer are stored after the 22+550 convolutional bias+weigths
-		mbias = (float *)fp_weights + 22 + 550;
-		// The 10*2880 weights are stored after the 10 bias values
-		// float *matW = (float *)fp_weights + 22 + 550 + 10;
-		
-		matIN = (float *)matCpool;
-		matOUT = (float *)matConn;
-		matOutB = (float *)matConnB;
+    // The 10 bias values of this layer are stored after the 22+550 convolutional bias+weigths
+    mbias = (float *)fp_weights + 22 + 550;
+    // The 10*2880 weights are stored after the 10 bias values
+    // float *matW = (float *)fp_weights + 22 + 550 + 10;
+    
+    matIN = (float *)matCpool;
+    matOUT = (float *)matConn;
+    matOutB = (float *)matConnB;
 
-        float aux[10] = {0};
-        float *aux2,*aux3;
+    float *aux2,*aux3;
 
-        for(int it = 0; it < 10; it++) matOUT[it] = 0;
+    for(int it = 0; it < 40; it++) aux[it] = 0;
+    for(int it = 0; it < 10; it++) matOUT[it] = 0;
 
-        for(int k=0; k < 4; k++) {
-            aux2 = (float *)subMatsWeights+k*7920;
-            aux3 = (float *)matIN + k*792;
-            gemm(aux2, aux3, aux, 10, 792, 1);
-            for(int it = 0; it < 10; it++) matOUT[it] += aux[it];
-        }
-		
-		// A(10*3168) * B(3168*1) -> C(10*1)
-		//gemm(matW, matIN, matOUT, 10, 3168, 1);
-		// print_fp((float *)matConn, 10, "Connected");
-		// print_fp(mbias, 10, "Bias");
-			
-		add_bias(matOUT, 10, 1, mbias, (float *)matOutB, 0);
-		// print_fp((float *)matConnB, 10, "Connected+Bias");
-		// Output vector ConnB has 10 values, one for each digit
+    for(int k=0; k < 4; k++) {
+        aux2 = (float *)subMatsWeights+k*7920;
+        aux3 = (float *)matIN + k*792;
+        gemm(aux2, aux3, (float *)aux + k*10, 10, 792, 1);
+        for(int it = 0; it < 10; it++) matOUT[it] += aux[it];
+    }
+    
+    // A(10*3168) * B(3168*1) -> C(10*1)
+    //gemm(matW, matIN, matOUT, 10, 3168, 1);
+    // print_fp((float *)matConn, 10, "Connected");
+    // print_fp(mbias, 10, "Bias");
+        
+    add_bias(matOUT, 10, 1, mbias, (float *)matOutB, 0);
+    // print_fp((float *)matConnB, 10, "Connected+Bias");
+    // Output vector ConnB has 10 values, one for each digit
 }
 
+#if USEHARDWARE 
+void forward_connected_layer_HARDWARE()
+{
+    float *matIN, *mbias, *matOUT, *matOutB;
+    float *TxBufferPtr, *RxBufferPtr;
+
+    // The 10 bias values of this layer are stored after the 22+550 convolutional bias+weigths
+    mbias = (float *)fp_weights + 22 + 550;
+    // The 10*2880 weights are stored after the 10 bias values
+    // float *matW = (float *)fp_weights + 22 + 550 + 10;
+    
+    matIN = (float *)matCpool;
+    matOUT = (float *)matConn;
+    matOutB = (float *)matConnB;
+
+    float *aux2,*aux3;
+
+    for(int it = 0; it < 40; it++) aux[it] = 0;
+    for(int it = 0; it < 10; it++) matOUT[it] = 0;
+
+    Xil_DCacheFlushRange((INTPTR)(matIN), (unsigned)(12*12*22));
+    Xil_DCacheFlushRange((INTPTR)(subMatsWeights), (unsigned)(12*12*22*10));
+
+    TxBufferPtr = (float *) matIN;
+    XAxiDma_SimpleTransfer(&AxiDma[0],(UINTPTR) TxBufferPtr,
+                792, XAXIDMA_DMA_TO_DEVICE);
+    TxBufferPtr = (float *) matIN+1*792;
+    XAxiDma_SimpleTransfer(&AxiDma[1],(UINTPTR) TxBufferPtr,
+                792, XAXIDMA_DMA_TO_DEVICE);
+    TxBufferPtr = (float *) matIN+2*792;
+    XAxiDma_SimpleTransfer(&AxiDma[2],(UINTPTR) TxBufferPtr,
+                792, XAXIDMA_DMA_TO_DEVICE);
+    TxBufferPtr = (float *) matIN+3*792;
+    XAxiDma_SimpleTransfer(&AxiDma[3],(UINTPTR) TxBufferPtr,
+                792, XAXIDMA_DMA_TO_DEVICE);
+
+    /* Wait for Tx*/ 
+    while ( XAxiDma_Busy(&AxiDma[0], XAXIDMA_DMA_TO_DEVICE) ||
+            XAxiDma_Busy(&AxiDma[1], XAXIDMA_DMA_TO_DEVICE) ||
+            XAxiDma_Busy(&AxiDma[2], XAXIDMA_DMA_TO_DEVICE) ||
+            XAxiDma_Busy(&AxiDma[3], XAXIDMA_DMA_TO_DEVICE) ) {}
+
+    RxBufferPtr = (float *) aux;
+    XAxiDma_SimpleTransfer(&AxiDma[0],(UINTPTR) (RxBufferPtr),
+                10, XAXIDMA_DEVICE_TO_DMA);
+    RxBufferPtr = (float *) aux+1*10;
+    XAxiDma_SimpleTransfer(&AxiDma[1],(UINTPTR) (RxBufferPtr),
+                10, XAXIDMA_DEVICE_TO_DMA);
+    RxBufferPtr = (float *) aux+2*10;
+    XAxiDma_SimpleTransfer(&AxiDma[2],(UINTPTR) (RxBufferPtr),
+                10, XAXIDMA_DEVICE_TO_DMA);
+    RxBufferPtr = (float *) aux+3*10;
+    XAxiDma_SimpleTransfer(&AxiDma[3],(UINTPTR) (RxBufferPtr),
+                10, XAXIDMA_DEVICE_TO_DMA);
+
+    TxBufferPtr = (float *) subMatsWeights;
+    XAxiDma_SimpleTransfer(&AxiDma[0],(UINTPTR) TxBufferPtr,
+                7920, XAXIDMA_DMA_TO_DEVICE);
+    TxBufferPtr = (float *) subMatsWeights+1*7920;
+    XAxiDma_SimpleTransfer(&AxiDma[1],(UINTPTR) TxBufferPtr,
+                7920, XAXIDMA_DMA_TO_DEVICE);
+    TxBufferPtr = (float *) subMatsWeights+2*7920;
+    XAxiDma_SimpleTransfer(&AxiDma[2],(UINTPTR) TxBufferPtr,
+                7920, XAXIDMA_DMA_TO_DEVICE);
+    TxBufferPtr = (float *) subMatsWeights+3*7920;
+    XAxiDma_SimpleTransfer(&AxiDma[3],(UINTPTR) TxBufferPtr,
+                7920, XAXIDMA_DMA_TO_DEVICE);
+
+    /* Wait for Tx*/ 
+    while ( XAxiDma_Busy(&AxiDma[0], XAXIDMA_DMA_TO_DEVICE) ||
+            XAxiDma_Busy(&AxiDma[1], XAXIDMA_DMA_TO_DEVICE) ||
+            XAxiDma_Busy(&AxiDma[2], XAXIDMA_DMA_TO_DEVICE) ||
+            XAxiDma_Busy(&AxiDma[3], XAXIDMA_DMA_TO_DEVICE) ) {}
+
+    /* Wait for Rx*/ 
+    while ( XAxiDma_Busy(&AxiDma[0], XAXIDMA_DEVICE_TO_DMA) ||
+            XAxiDma_Busy(&AxiDma[1], XAXIDMA_DEVICE_TO_DMA) ||
+            XAxiDma_Busy(&AxiDma[2], XAXIDMA_DEVICE_TO_DMA) ||
+            XAxiDma_Busy(&AxiDma[3], XAXIDMA_DEVICE_TO_DMA) ) {}
+
+
+
+    Xil_DCacheInvalidateRange((INTPTR)(aux), (unsigned)(40));
+
+    for(int k=0; k<4; k++)
+        for(int it = 0; it < 10; it++) matOUT[it] += aux[it];
+
+    
+    // A(10*3168) * B(3168*1) -> C(10*1)
+    //gemm(matW, matIN, matOUT, 10, 3168, 1);
+    // print_fp((float *)matConn, 10, "Connected");
+    // print_fp(mbias, 10, "Bias");
+        
+    add_bias(matOUT, 10, 1, mbias, (float *)matOutB, 0);
+    // print_fp((float *)matConnB, 10, "Connected+Bias");
+    // Output vector ConnB has 10 values, one for each digit
+}
+#endif
 
 // Digit classification is performed using 4 layers:
 // 1. Convolutional layer
@@ -450,13 +829,34 @@ int predict_mnist()
 	double *ptime, *measure_time();
 	
 	measure_time(0);
+#if USEHARDWARE
+	forward_convolutional_layer_HARDWARE();
+#else
 	forward_convolutional_layer();
+#endif
+
 	measure_time(1);
+#if USEDUALCORE
+	forward_maxpool_layer_2core();
+#else
 	forward_maxpool_layer();
+#endif
+
 	measure_time(2);
+#if USEHARDWARE
+	forward_connected_layer_HARDWARE();
+#else
 	forward_connected_layer();
+#endif
+
 	measure_time(3);
+#if USEDUALCORE
+	forward_softmax_layer_2core();
+#else
 	best = forward_softmax_layer();
+#endif
+
+
 	ptime = measure_time(4);
 #if PRINT_TIME_PER_LAYER
 	printf("Layer 1 (Convolutional) took %.0f us.\n", ptime[0]);
@@ -497,6 +897,7 @@ int predict_mnist2()
 #endif
 	return best;
 }
+
 
 void define_memory_regions()
 {
@@ -546,6 +947,10 @@ static float *paddress = (float *)MEM_DATA_BASE_ADDRESS;
     paddress += 10;
     // Aux mat of (10)*(12*12*22) elements. Region size = 3168 * 4 Bytes
     subMatsWeights = paddress;
+    paddress += 3168;
+    // Aux array of 40 elements. Region size = 40 * 4 Bytes
+    aux = paddress;
+    paddress += 40;
 
 	// printf("%p, %d\n", (void *)paddress+10, (paddress+10)-(float *)MEM_DATA_BASE_ADDRESS);
 	// Total data region size is 71898 * 4 = 287,592 Bytes
@@ -599,12 +1004,21 @@ void upload_images_and_weights(void *pim, void *pwe, int size_im, int size_we)
 	fclose(fweights);
 }
 
-int main(int argc, char **argv){
+int main(int argc, char **argv)
+{
 
 	unsigned int image_to_classify = 1; //default
 	int prediction;
 	
 	define_memory_regions();
+
+#if USEHARDWARE
+    init_dma();
+#endif
+
+#if USEDUALCORE
+	Xil_SetTlbAttributes(0xFFFFFC00,0x14de2);
+#endif
 	
 #if EMBEDDED == 0
 	upload_images_and_weights((void *)ch_images, (void *)fp_weights, 
@@ -622,11 +1036,9 @@ int main(int argc, char **argv){
 		print_pgm((unsigned char *)ch_images, image_to_classify);
 #endif
 
-#if EMBEDDED == 0
-		prediction = predict_mnist2();
-#else
-		prediction = predict_mnist_HARDWARE();
-#endif
+
+
+        prediction = predict_mnist();
 
 		printf("Image %d -> Digit %d %f\n", image_to_classify, prediction, matSoftM[prediction]*100);
 	}

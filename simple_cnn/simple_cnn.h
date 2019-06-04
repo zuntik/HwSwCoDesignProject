@@ -1,4 +1,6 @@
-#define EMBEDDED 0
+#define EMBEDDED 1
+#define USEHARDWARE 0
+#define USEDUALCORE 0
 
 #define TOTAL_WEIGTHS (22+22*5*5+10+10*22*12*12)
 #define FLT_MAX 3.402823466e+38F
@@ -22,6 +24,10 @@ static float memory_data[110000];
 #define MEM_DATA_BASE_ADDRESS memory_data
 #define MEM_IMAGES_BASE_ADDRESS memory_images
 #define MEM_WEIGTHS_BASE_ADDRESS memory_weights
+#endif
+
+#if USEDUALCORE
+#define XPAR_CPU_ID 0U
 #endif
 
 #define PRINT_IMAGE 0
