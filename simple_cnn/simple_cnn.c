@@ -21,6 +21,9 @@ volatile float *matConn;  // Intermediate output (before adding bias) of fully c
 volatile float *matConnB; // Output of fully connected layer (10 elements)
 volatile float *matSoftM; // Output of softmax layer (10 elements)
 
+
+volatile float *subMatsWeights; // Auxiliary matrix for 3rd layer
+
 // Matrix multiplication: C = A * B
 void gemm(float *A, float *B, float *C, int rowsA, int colsA, int colsB)
 {
@@ -107,6 +110,36 @@ void prepare_matrixA()
 	}
 }
 
+void prepare_sub_matrices()
+{
+    float *matW = (float *)fp_weights + 22 + 550 + 10;
+    int i, j, k;
+
+    for(k=0; k < 4; k++) {
+        for(i=0; i<10; i++) {
+            for(j=0; j<792; j++) {
+                subMatsWeights[ k*7920 + (i*792 + j) ] = matW[ i*3168 +  k*792+j ];
+            }
+        }
+    }
+}
+
+/*
+void prepare_sub_matrices()
+{
+    float *matW = (float *)fp_weights + 22 + 550 + 10;
+    int i, j, k;
+    for(k=0; k < 22; k++) {
+        for(i=0; i<10; i++) {
+            for(j=0; j<144; j++) {
+                subMatsWeights[ k*1440 + (i*144 + j) ] = matW[ i*3168 +  k*144+j ];
+            }
+        }
+    }
+}
+*/
+
+
 // Prints first <size> elements of matrix f
 void print_fp(float *f, int size, char *c)
 {
@@ -162,6 +195,49 @@ int forward_softmax_layer()
 	return best;
 }
 
+int forward_softmax_layer2()
+{
+	int i, n=10, best=-1;
+	float sum1 = 0.0, sum2 = 0.0, sum, e;
+	float largest = -FLT_MAX;
+
+    // Finding the biggest element should be done by core 1
+	for(i = 0; i < n; ++i){
+		if(matConnB[i] > largest) {
+			largest = matConnB[i];
+			best = i;
+		}
+	}
+	
+    // only the exponentiation should be distributed
+    
+    // place in core 1
+	for(i = 0; i < 5; ++i){
+		e = exp(matConnB[i]);
+		sum1 += e;
+		matSoftM[i] = e;
+	}
+
+    // TODO: place in core 2
+	for(i = 5; i < n; ++i){
+		e = exp(matConnB[i]);
+		sum2 += e;
+		matSoftM[i] = e;
+	}
+
+
+    // done by core 1
+    sum = sum1 + sum2;
+	for(i = 0; i < n; ++i){
+		matSoftM[i] /= sum;
+	}
+
+	//print_fp((float *)matSoftM, 10, "Softmax");
+
+	return best;
+}
+
+
 // The max-pool layer condenses the 24*24 images to 12*12,
 // computing the maximum value for each 2*2 input region.
 void forward_maxpool_layer()
@@ -197,6 +273,61 @@ void forward_maxpool_layer()
 	// Output matrix Cpool is 22*144, that is this layer outputs 22 12*12 images.
 }
 
+void forward_maxpool_layer2()
+{
+	int i, j, k, n, m, row, col, index;
+	int size=2, stride=2;
+	int oh=12, ow=12;
+	int ih=24, iw=24, chan=22;
+	float max = -FLT_MAX, val;
+	float *pout, *pin;
+
+	pin = (float *)matCbias;
+	pout = (float *)matCpool;
+	
+    // first half
+	for(k = 0; k < chan; ++k){
+		for(i = 0; i < oh; ++i) {
+			for(j = 0; j < ow; ++j) {
+	            max = -FLT_MAX;
+	            for(n = 0; n < size; ++n){
+		            for(m = 0; m < size; ++m){
+                        row = i*stride + n;
+                        col = j*stride + m;
+                        index = col + iw * (row + ih * k);
+                        val = pin[index] ;
+                        max = (val > max) ? val : max;
+		            }
+	            }
+	            pout[j + ow * (i + oh * k)] = max;
+			}
+		}
+	}
+
+    // second half TODO: put in second core
+	for(k = 11; k < chan; ++k){
+		for(i = 0; i < oh; ++i) {
+			for(j = 0; j < ow; ++j) {
+	            max = -FLT_MAX;
+	            for(n = 0; n < size; ++n){
+		            for(m = 0; m < size; ++m){
+                        row = i*stride + n;
+                        col = j*stride + m;
+                        index = col + iw * (row + ih * k);
+                        val = pin[index] ;
+                        max = (val > max) ? val : max;
+		            }
+	            }
+	            pout[j + ow * (i + oh * k)] = max;
+			}
+		}
+	}
+
+	// print_fp((float *)matCpool, 120, "Pool");
+	// Output matrix Cpool is 22*144, that is this layer outputs 22 12*12 images.
+}
+
+
 // The convolution layer consists of 22 feature maps.
 // Each feature map has a set of 5*5 weights and a single bias.
 void forward_convolutional_layer()
@@ -215,6 +346,31 @@ void forward_convolutional_layer()
 		// gemm((float *)matA, (float *)matBT, (float *)matC, 24*24, 25, 22);
 		gemmBT((float *)matA, (float *)matB, (float *)matC, 24*24, 25, 22);
 		
+		// Add bias and transpose. 
+		add_bias((float *)matC, 24*24, 22, (float *)fp_weights, (float *)matCbias, 1);
+		// print_fp((float *)matCbias, 300, "Convolutional+Bias");
+		// There is no activation function
+		// Output matrix Cbias is 22*576, that is this layer outputs 22 24*24 images.
+}
+
+void forward_convolutional_layer2()
+{
+        int k;
+        float *auxIn, *auxOut;
+        float auxMatC[24*24*22]={0};
+
+		// The 22 maps weights are stored as a 22*5*5 matrix (after the initial 22 bias values)
+		matB = fp_weights + 22;
+		
+		for( k=0; k<22; k++ ) {
+            auxIn = (float *) matB + k*25;
+            auxOut = (float *) auxMatC + k*576;
+            gemm((float *)matA, auxIn, auxOut, 576, 25, 1);
+        }
+
+
+        transpose(auxMatC,  22, 576 , (float *)matC);
+
 		// Add bias and transpose. 
 		add_bias((float *)matC, 24*24, 22, (float *)fp_weights, (float *)matCbias, 1);
 		// print_fp((float *)matCbias, 300, "Convolutional+Bias");
@@ -247,6 +403,42 @@ void forward_connected_layer()
 		// Output vector ConnB has 10 values, one for each digit
 }
 
+void forward_connected_layer2()
+{
+		float *matIN, *mbias, *matOUT, *matOutB;
+
+		// The 10 bias values of this layer are stored after the 22+550 convolutional bias+weigths
+		mbias = (float *)fp_weights + 22 + 550;
+		// The 10*2880 weights are stored after the 10 bias values
+		// float *matW = (float *)fp_weights + 22 + 550 + 10;
+		
+		matIN = (float *)matCpool;
+		matOUT = (float *)matConn;
+		matOutB = (float *)matConnB;
+
+        float aux[10] = {0};
+        float *aux2,*aux3;
+
+        for(int it = 0; it < 10; it++) matOUT[it] = 0;
+
+        for(int k=0; k < 4; k++) {
+            aux2 = (float *)subMatsWeights+k*7920;
+            aux3 = (float *)matIN + k*792;
+            gemm(aux2, aux3, aux, 10, 792, 1);
+            for(int it = 0; it < 10; it++) matOUT[it] += aux[it];
+        }
+		
+		// A(10*3168) * B(3168*1) -> C(10*1)
+		//gemm(matW, matIN, matOUT, 10, 3168, 1);
+		// print_fp((float *)matConn, 10, "Connected");
+		// print_fp(mbias, 10, "Bias");
+			
+		add_bias(matOUT, 10, 1, mbias, (float *)matOutB, 0);
+		// print_fp((float *)matConnB, 10, "Connected+Bias");
+		// Output vector ConnB has 10 values, one for each digit
+}
+
+
 // Digit classification is performed using 4 layers:
 // 1. Convolutional layer
 // 2. Pooling layer
@@ -275,9 +467,40 @@ int predict_mnist()
 	return best;
 }
 
+int predict_mnist2()
+{
+	int best;
+	double *ptime, *measure_time();
+	
+    // Matrix A is prepared (with 24*24=576 rows and 5*5=25 columns)
+    // in order to do the convolutions as a matrix multiplication
+    // such that, A(576*25) * BT(25*22) -> C(576*22)
+    prepare_matrixA();
+
+    prepare_sub_matrices();
+
+	measure_time(0);
+	forward_convolutional_layer2();
+	measure_time(1);
+	forward_maxpool_layer2();
+	measure_time(2);
+	forward_connected_layer2();
+	measure_time(3);
+	best = forward_softmax_layer2();
+	ptime = measure_time(4);
+
+#if PRINT_TIME_PER_LAYER
+	printf("Layer 1 (Convolutional) took %.0f us.\n", ptime[0]);
+	printf("Layer 2 (Pooling) took %.0f us.\n", ptime[1]);
+	printf("Layer 3 (Fully-Connected) took %.0f us.\n", ptime[2]);
+	printf("Layer 4 (Soft-max) took %.0f us.\n", 1.0 * ptime[3]);
+#endif
+	return best;
+}
+
 void define_memory_regions()
 {
-	static float *paddress = (float *)MEM_DATA_BASE_ADDRESS;
+static float *paddress = (float *)MEM_DATA_BASE_ADDRESS;
 
 	// Region Size NIMAGES*IMAGE_HEIGTH*IMAGE_WIDTH+16 = 78416 Bytes (100 images)
 	ch_images = (unsigned char *)MEM_IMAGES_BASE_ADDRESS;
@@ -320,6 +543,9 @@ void define_memory_regions()
 	paddress += 10;
 	// Aux matrix of 10 elements. Region Size = 10 * 4 Bytes
 	matSoftM = paddress;
+    paddress += 10;
+    // Aux mat of (10)*(12*12*22) elements. Region size = 3168 * 4 Bytes
+    subMatsWeights = paddress;
 
 	// printf("%p, %d\n", (void *)paddress+10, (paddress+10)-(float *)MEM_DATA_BASE_ADDRESS);
 	// Total data region size is 71898 * 4 = 287,592 Bytes
@@ -396,8 +622,15 @@ int main(int argc, char **argv){
 		print_pgm((unsigned char *)ch_images, image_to_classify);
 #endif
 
-		prediction = predict_mnist();
+#if EMBEDDED == 0
+		prediction = predict_mnist2();
+#else
+		prediction = predict_mnist_HARDWARE();
+#endif
+
 		printf("Image %d -> Digit %d %f\n", image_to_classify, prediction, matSoftM[prediction]*100);
 	}
 
 }
+
+// vim:foldmethod=syntax
