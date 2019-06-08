@@ -192,7 +192,7 @@ int main(int argc, char **argv)
 	while(*sync_f != ZERO_STARTED) {}
 	*sync_f = ONE_STARTED;
 
-	printf("I, core 1, have started\n");
+    printf("Process on core one has started!\n");
 	
     while(1) {
     	forward_maxpool_layer_2core();

@@ -235,7 +235,7 @@ int forward_softmax_layer()
 			best = i;
 		}
 	}
-	
+
 	for(i = 0; i < n; ++i){
 		e = exp(matConnB[i] - largest);
 		sum += e;
@@ -248,51 +248,6 @@ int forward_softmax_layer()
 
 	return best;
 }
-
-int forward_softmax_layer2()
-{
-	int i, best=-1;
-	float sum, e;
-	float largest = -FLT_MAX;
-
-    // Finding the biggest element should be done by core 1
-	for(i = 0; i < 10; ++i){
-		if(matConnB[i] > largest) {
-			largest = matConnB[i];
-			best = i;
-		}
-	}
-	
-    *sum1 = 0;
-    *sum2 = 0;
-    // only the exponentiation should be distributed
-    
-    // place in core 1
-	for(i = 0; i < 5; ++i){
-		e = exp(matConnB[i]);
-		*sum1 += e;
-		matSoftM[i] = e;
-	}
-
-    // TODO: place in core 2
-	for(i = 5; i < 10; ++i){
-		e = exp(matConnB[i]);
-		*sum2 += e;
-		matSoftM[i] = e;
-	}
-
-
-    // done by core 1
-    sum = *sum1 + *sum2;
-	for(i = 0; i < 10; ++i){
-		matSoftM[i] /= sum;
-	}
-
-	//print_fp((float *)matSoftM, 10, "Softmax");
-
-	return best;
-}
-
 #if USEDUALCORE
 int forward_softmax_layer_2core()
 {
@@ -342,7 +297,7 @@ void forward_maxpool_layer()
 
 	pin = (float *)matCbias;
 	pout = (float *)matCpool;
-	
+
 	for(k = 0; k < chan; ++k){
 		for(i = 0; i < oh; ++i) {
 			for(j = 0; j < ow; ++j) {
@@ -363,62 +318,6 @@ void forward_maxpool_layer()
 	// print_fp((float *)matCpool, 120, "Pool");
 	// Output matrix Cpool is 22*144, that is this layer outputs 22 12*12 images.
 }
-
-void forward_maxpool_layer2()
-{
-	int i, j, k, n, m, row, col, index;
-	int size=2, stride=2;
-	int oh=12, ow=12;
-	int ih=24, iw=24, chan=22;
-	float max = -FLT_MAX, val;
-	float *pout, *pin;
-
-	pin = (float *)matCbias;
-	pout = (float *)matCpool;
-	
-    // first half
-	for(k = 0; k < chan; ++k){
-		for(i = 0; i < oh; ++i) {
-			for(j = 0; j < ow; ++j) {
-	            max = -FLT_MAX;
-	            for(n = 0; n < size; ++n){
-		            for(m = 0; m < size; ++m){
-                        row = i*stride + n;
-                        col = j*stride + m;
-                        index = col + iw * (row + ih * k);
-                        val = pin[index] ;
-                        max = (val > max) ? val : max;
-		            }
-	            }
-	            pout[j + ow * (i + oh * k)] = max;
-			}
-		}
-	}
-
-    // second half TODO: put in second core
-	for(k = 11; k < chan; ++k){
-		for(i = 0; i < oh; ++i) {
-			for(j = 0; j < ow; ++j) {
-	            max = -FLT_MAX;
-	            for(n = 0; n < size; ++n){
-		            for(m = 0; m < size; ++m){
-                        row = i*stride + n;
-                        col = j*stride + m;
-                        index = col + iw * (row + ih * k);
-                        val = pin[index] ;
-                        max = (val > max) ? val : max;
-		            }
-	            }
-	            pout[j + ow * (i + oh * k)] = max;
-			}
-		}
-	}
-
-	// print_fp((float *)matCpool, 120, "Pool");
-	// Output matrix Cpool is 22*144, that is this layer outputs 22 12*12 images.
-}
-
-
 #if USEDUALCORE 
 void forward_maxpool_layer_2core()
 {
@@ -491,56 +390,6 @@ void forward_convolutional_layer()
     // Output matrix Cbias is 22*576, that is this layer outputs 22 24*24 images.
 
 }
-
-void forward_convolutional_layer2()
-{
-    float *auxIn, *auxOut;
-    //float auxMatC[24*24*22]={0};
-
-    // The 22 maps weights are stored as a 22*5*5 matrix (after the initial 22 bias values)
-    matB = fp_weights + 22;
-    
-    prepare_matrixA();
-
-    /*
-    for( k=0; k<22; k++ ) {
-        auxIn = (float *) matB + k*25;
-        auxOut = (float *) auxMatC + k*576;
-        gemm((float *)matA, auxIn, auxOut, 576, 25, 1);
-    }
-    */
-
-    for( int i=0; i<7; i++ ) {
-    	printf("%d\n",i);
-        auxIn = (float *) matB + (i*3)*25;
-        auxOut = (float *) auxMatC + (i*3)*576;
-        gemm((float *)matA, auxIn, auxOut, 576, 25, 1);
-        auxIn = (float *) matB + (i*3+1)*25;
-        auxOut = (float *) auxMatC + (i*3+1)*576;
-        gemm((float *)matA, auxIn, auxOut, 576, 25, 1);
-        auxIn = (float *) matB + (i*3+2)*25;
-        auxOut = (float *) auxMatC + (i*3+2)*576;
-        gemm((float *)matA, auxIn, auxOut, 576, 25, 1);
-    }
-
-    auxIn = (float *) matB + (21)*25;
-    auxOut = (float *) auxMatC + (21)*576;
-    gemm((float *)matA, auxIn, auxOut, 576, 25, 1);
-
-
-    transpose((float *)auxMatC,  22, 576 , (float *)matC);
-
-    //gemmBT((float *)matA, (float *)matB, (float *)matC, 24*24, 25, 22);
-
-
-    // Add bias and transpose. 
-    add_bias((float *)matC, 24*24, 22, (float *)fp_weights, (float *)matCbias, 1);
-    // print_fp((float *)matCbias, 300, "Convolutional+Bias");
-    // There is no activation function
-    // Output matrix Cbias is 22*576, that is this layer outputs 22 24*24 images.
-
-}
-
 #if USEHARDWARE 
 void forward_convolutional_layer_HARDWARE()
 {
@@ -639,7 +488,6 @@ void forward_convolutional_layer_HARDWARE()
     
 
 }
-
 #endif
 
 
@@ -667,53 +515,6 @@ void forward_connected_layer()
 		// print_fp((float *)matConnB, 10, "Connected+Bias");
 		// Output vector ConnB has 10 values, one for each digit
 }
-
-void forward_connected_layer2()
-{
-    float *matIN, *mbias, *matOUT, *matOutB;
-
-    // The 10 bias values of this layer are stored after the 22+550 convolutional bias+weigths
-    mbias = (float *)fp_weights + 22 + 550;
-    // The 10*2880 weights are stored after the 10 bias values
-    // float *matW = (float *)fp_weights + 22 + 550 + 10;
-    
-    matIN = (float *)matCpool;
-    matOUT = (float *)matConn;
-    matOutB = (float *)matConnB;
-
-    float *aux2,*aux3;
-    prepare_sub_matrices();
-
-    for(int it = 0; it < 60; it++) aux[it] = 0;
-    for(int it = 0; it < 10; it++) matOUT[it] = 0;
-
-    for(int i = 0; i<2; i++) {
-    	printf("u\n");
-		aux2 = (float *)subMatsWeights+5280*(i*3);
-		aux3 = (float *)matIN + 528*(i*3);
-		gemm(aux2, aux3, (float *)aux, 10, 528, 1);
-		for(int it = 0; it < 10; it++) matOUT[it] += aux[it];
-		aux2 = (float *)subMatsWeights+5280*(i*3+1);
-		aux3 = (float *)matIN + 528*(i*3+1);
-		gemm(aux2, aux3, (float *)aux, 10, 528, 1);
-		for(int it = 0; it < 10; it++) matOUT[it] += aux[it];
-		aux2 = (float *)subMatsWeights+5280*(i*3+2);
-		aux3 = (float *)matIN + 528*(i*3+2);
-		gemm(aux2, aux3, (float *)aux, 10, 528, 1);
-		for(int it = 0; it < 10; it++) matOUT[it] += aux[it];
-    }
-
-    
-    // A(10*3168) * B(3168*1) -> C(10*1)
-    //gemm(matW, matIN, matOUT, 10, 3168, 1);
-    // print_fp((float *)matConn, 10, "Connected");
-    // print_fp(mbias, 10, "Bias");
-        
-    add_bias(matOUT, 10, 1, mbias, (float *)matOutB, 0);
-    // print_fp((float *)matConnB, 10, "Connected+Bias");
-    // Output vector ConnB has 10 values, one for each digit
-}
-
 #if USEHARDWARE 
 void forward_connected_layer_HARDWARE()
 {
@@ -835,37 +636,6 @@ int predict_mnist()
 
 
 	ptime = measure_time(4);
-#if PRINT_TIME_PER_LAYER
-	printf("Layer 1 (Convolutional) took %.0f us.\n", ptime[0]);
-	printf("Layer 2 (Pooling) took %.0f us.\n", ptime[1]);
-	printf("Layer 3 (Fully-Connected) took %.0f us.\n", ptime[2]);
-	printf("Layer 4 (Soft-max) took %.0f us.\n", 1.0 * ptime[3]);
-#endif
-	return best;
-}
-
-int predict_mnist2()
-{
-	int best;
-	double *ptime, *measure_time();
-	
-    // Matrix A is prepared (with 24*24=576 rows and 5*5=25 columns)
-    // in order to do the convolutions as a matrix multiplication
-    // such that, A(576*25) * BT(25*22) -> C(576*22)
-    prepare_matrixA();
-
-    prepare_sub_matrices();
-
-	measure_time(0);
-	forward_convolutional_layer2();
-	measure_time(1);
-	forward_maxpool_layer2();
-	measure_time(2);
-	forward_connected_layer2();
-	measure_time(3);
-	best = forward_softmax_layer2();
-	ptime = measure_time(4);
-
 #if PRINT_TIME_PER_LAYER
 	printf("Layer 1 (Convolutional) took %.0f us.\n", ptime[0]);
 	printf("Layer 2 (Pooling) took %.0f us.\n", ptime[1]);
@@ -1011,9 +781,8 @@ int main(int argc, char **argv)
 #if USEDUALCORE
 	Xil_SetTlbAttributes(0xFFFFFC00,0x14de2);
     *sync_f = ZERO_STARTED;
-    printf("Zero started!\n");
+    printf("Process on core zero has started!\n");
     while(*sync_f != ONE_STARTED){}
-    printf("One started!\n");
 #endif
 
 	
@@ -1039,5 +808,3 @@ int main(int argc, char **argv)
 	}
 
 }
-
-// vim:foldmethod=syntax
