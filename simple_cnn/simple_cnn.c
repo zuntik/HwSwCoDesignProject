@@ -12,7 +12,6 @@
 #define DMA_DEV_ID0		XPAR_AXIDMA_0_DEVICE_ID
 #define DMA_DEV_ID1		XPAR_AXIDMA_1_DEVICE_ID
 #define DMA_DEV_ID2		XPAR_AXIDMA_2_DEVICE_ID
-#define DMA_DEV_ID3		XPAR_AXIDMA_3_DEVICE_ID
 #endif
 
 #if USEDUALCORE
@@ -22,7 +21,7 @@
 
 
 #if USEHARDWARE
-XAxiDma AxiDma[4];
+XAxiDma AxiDma[3];
 #endif
 
 #if USEDUALCORE
@@ -50,6 +49,7 @@ volatile float *matSoftM; // Output of softmax layer (10 elements)
 
 volatile float *subMatsWeights; // Auxiliary matrix for 3rd layer
 volatile float *aux; // Auxiliary array for 
+volatile float *auxMatC;
 
 
 #if USEHARDWARE
@@ -83,12 +83,11 @@ int init_XAxiDma_SimplePollMode(u16 DeviceId, int i)
   return XST_SUCCESS;
 }
 int init_dma() {
-    int a,b,c,d;
+    int a,b,c;
     a = init_XAxiDma_SimplePollMode(DMA_DEV_ID0,0);
     b = init_XAxiDma_SimplePollMode(DMA_DEV_ID1,1);
     c = init_XAxiDma_SimplePollMode(DMA_DEV_ID2,2);
-    d = init_XAxiDma_SimplePollMode(DMA_DEV_ID3,3);
-    return a && b && c && d;
+    return a && b && c;
 }
 #endif
 
@@ -179,34 +178,20 @@ void prepare_matrixA()
 	}
 }
 
+
 void prepare_sub_matrices()
 {
     float *matW = (float *)fp_weights + 22 + 550 + 10;
     int i, j, k;
 
-    for(k=0; k < 4; k++) {
+    for(k=0; k < 6; k++) {
         for(i=0; i<10; i++) {
-            for(j=0; j<792; j++) {
-                subMatsWeights[ k*7920 + (i*792 + j) ] = matW[ i*3168 +  k*792+j ];
+            for(j=0; j<528; j++) {
+                subMatsWeights[ k*5280 + (i*528 + j) ] = matW[ i*3168 +  k*528+j ];
             }
         }
     }
 }
-
-/*
-void prepare_sub_matrices()
-{
-    float *matW = (float *)fp_weights + 22 + 550 + 10;
-    int i, j, k;
-    for(k=0; k < 22; k++) {
-        for(i=0; i<10; i++) {
-            for(j=0; j<144; j++) {
-                subMatsWeights[ k*1440 + (i*144 + j) ] = matW[ i*3168 +  k*144+j ];
-            }
-        }
-    }
-}
-*/
 
 
 // Prints first <size> elements of matrix f
@@ -289,7 +274,6 @@ int forward_softmax_layer2()
 		matSoftM[i] = e;
 	}
 
-    printf("here\n");
     // TODO: place in core 2
 	for(i = 5; i < 10; ++i){
 		e = exp(matConnB[i]);
@@ -362,17 +346,17 @@ void forward_maxpool_layer()
 	for(k = 0; k < chan; ++k){
 		for(i = 0; i < oh; ++i) {
 			for(j = 0; j < ow; ++j) {
-	max = -FLT_MAX;
-	for(n = 0; n < size; ++n){
-		for(m = 0; m < size; ++m){
-			row = i*stride + n;
-			col = j*stride + m;
-			index = col + iw * (row + ih * k);
-			val = pin[index] ;
-			max = (val > max) ? val : max;
-		}
-	}
-	pout[j + ow * (i + oh * k)] = max;
+				max = -FLT_MAX;
+				for(n = 0; n < size; ++n){
+					for(m = 0; m < size; ++m){
+						row = i*stride + n;
+						col = j*stride + m;
+						index = col + iw * (row + ih * k);
+						val = pin[index] ;
+						max = (val > max) ? val : max;
+					}
+				}
+				pout[j + ow * (i + oh * k)] = max;
 			}
 		}
 	}
@@ -441,15 +425,18 @@ void forward_maxpool_layer_2core()
 	int i, j, k, n, m, row, col, index;
 	int size=2, stride=2;
 	int oh=12, ow=12;
-	int ih=24, iw=24, chan=22;
+	int ih=24, iw=24;
 	float max = -FLT_MAX, val;
 	float *pout, *pin;
 
 	pin = (float *)matCbias;
 	pout = (float *)matCpool;
 	
+    Xil_DCacheInvalidateRange((INTPTR)(auxMatC), (unsigned)(24*24*22));
+    *sync_f = DO_SECOND_LAYER;
+
     // first half
-	for(k = 0; k < chan; ++k){
+	for(k = 0; k < 11; ++k){
 		for(i = 0; i < oh; ++i) {
 			for(j = 0; j < ow; ++j) {
 	            max = -FLT_MAX;
@@ -466,6 +453,12 @@ void forward_maxpool_layer_2core()
 			}
 		}
 	}
+
+    Xil_DCacheFlushRange((INTPTR)(matB), (unsigned)(4*25*11));
+
+	while(*sync_f != SECOND_LAYER_DONE){}
+
+
 
 	// print_fp((float *)matCpool, 120, "Pool");
 	// Output matrix Cpool is 22*144, that is this layer outputs 22 12*12 images.
@@ -496,17 +489,19 @@ void forward_convolutional_layer()
     // print_fp((float *)matCbias, 300, "Convolutional+Bias");
     // There is no activation function
     // Output matrix Cbias is 22*576, that is this layer outputs 22 24*24 images.
+
 }
 
 void forward_convolutional_layer2()
 {
-    int k;
     float *auxIn, *auxOut;
-    float auxMatC[24*24*22]={0};
+    //float auxMatC[24*24*22]={0};
 
     // The 22 maps weights are stored as a 22*5*5 matrix (after the initial 22 bias values)
     matB = fp_weights + 22;
     
+    prepare_matrixA();
+
     /*
     for( k=0; k<22; k++ ) {
         auxIn = (float *) matB + k*25;
@@ -515,139 +510,123 @@ void forward_convolutional_layer2()
     }
     */
 
-    for( int i=0; i<5; i++ ) {
-        auxIn = (float *) matB + (i*4)*25;
-        auxOut = (float *) auxMatC + (i*4)*576;
+    for( int i=0; i<7; i++ ) {
+    	printf("%d\n",i);
+        auxIn = (float *) matB + (i*3)*25;
+        auxOut = (float *) auxMatC + (i*3)*576;
         gemm((float *)matA, auxIn, auxOut, 576, 25, 1);
-        auxIn = (float *) matB + (i*4+1)*25;
-        auxOut = (float *) auxMatC + (i*4+1)*576;
+        auxIn = (float *) matB + (i*3+1)*25;
+        auxOut = (float *) auxMatC + (i*3+1)*576;
         gemm((float *)matA, auxIn, auxOut, 576, 25, 1);
-        auxIn = (float *) matB + (i*4+2)*25;
-        auxOut = (float *) auxMatC + (i*4+2)*576;
-        gemm((float *)matA, auxIn, auxOut, 576, 25, 1);
-        auxIn = (float *) matB + (i*4+3)*25;
-        auxOut = (float *) auxMatC + (i*4+3)*576;
+        auxIn = (float *) matB + (i*3+2)*25;
+        auxOut = (float *) auxMatC + (i*3+2)*576;
         gemm((float *)matA, auxIn, auxOut, 576, 25, 1);
     }
 
-    auxIn = (float *) matB + (20)*25;
-    auxOut = (float *) auxMatC + (20)*576;
-    gemm((float *)matA, auxIn, auxOut, 576, 25, 1);
     auxIn = (float *) matB + (21)*25;
     auxOut = (float *) auxMatC + (21)*576;
     gemm((float *)matA, auxIn, auxOut, 576, 25, 1);
 
-    transpose(auxMatC,  22, 576 , (float *)matC);
+
+    transpose((float *)auxMatC,  22, 576 , (float *)matC);
+
+    //gemmBT((float *)matA, (float *)matB, (float *)matC, 24*24, 25, 22);
+
 
     // Add bias and transpose. 
     add_bias((float *)matC, 24*24, 22, (float *)fp_weights, (float *)matCbias, 1);
     // print_fp((float *)matCbias, 300, "Convolutional+Bias");
     // There is no activation function
     // Output matrix Cbias is 22*576, that is this layer outputs 22 24*24 images.
+
 }
 
 #if USEHARDWARE 
 void forward_convolutional_layer_HARDWARE()
 {
-    int k;
-    float *auxIn, *auxOut;
+    //float *aIn, *auxOut;
     float auxMatC[24*24*22]={0};
     float *TxBufferPtr, *RxBufferPtr;
 
 	// The 22 maps weights are stored as a 22*5*5 matrix (after the initial 22 bias values)
 	matB = fp_weights + 22;
 
+	prepare_matrixA();
+
+    Xil_DCacheFlushRange((INTPTR)(matA), (unsigned)(4*24*24*25));
     Xil_DCacheFlushRange((INTPTR)(matB), (unsigned)(4*25*22));
 
-    for( int i=0; i<5; i++) {
-        TxBufferPtr = (float *) matB + (i*4)*25;
-        XAxiDma_SimpleTransfer(&AxiDma[0],(UINTPTR) TxBufferPtr,
-				    100, XAXIDMA_DMA_TO_DEVICE);
-        TxBufferPtr = (float *) matB + (i*4+1)*25;
+    for( int i=0; i<7; i++) {
+        TxBufferPtr = (float *) matB + (i*3)*25;
+        if(XAxiDma_SimpleTransfer(&AxiDma[0],(UINTPTR) TxBufferPtr,
+				    25*4, XAXIDMA_DMA_TO_DEVICE)!=XST_SUCCESS)printf("fail\n");
+        TxBufferPtr = (float *) matB + (i*3+1)*25;
         XAxiDma_SimpleTransfer(&AxiDma[1],(UINTPTR) TxBufferPtr,
-				    100, XAXIDMA_DMA_TO_DEVICE);
-        TxBufferPtr = (float *) matB + (i*4+2)*25;
+				    25*4, XAXIDMA_DMA_TO_DEVICE);
+        TxBufferPtr = (float *) matB + (i*3+2)*25;
         XAxiDma_SimpleTransfer(&AxiDma[2],(UINTPTR) TxBufferPtr,
-				    100, XAXIDMA_DMA_TO_DEVICE);
-        TxBufferPtr = (float *) matB + (i*4+3)*25;
-        XAxiDma_SimpleTransfer(&AxiDma[3],(UINTPTR) TxBufferPtr,
-				    100, XAXIDMA_DMA_TO_DEVICE);
+				    25*4, XAXIDMA_DMA_TO_DEVICE);
+
 
         /* Wait for Tx*/ 
         while ( XAxiDma_Busy(&AxiDma[0], XAXIDMA_DMA_TO_DEVICE) ||
                 XAxiDma_Busy(&AxiDma[1], XAXIDMA_DMA_TO_DEVICE) ||
-                XAxiDma_Busy(&AxiDma[2], XAXIDMA_DMA_TO_DEVICE) ||
-                XAxiDma_Busy(&AxiDma[3], XAXIDMA_DMA_TO_DEVICE) ) {}
+                XAxiDma_Busy(&AxiDma[2], XAXIDMA_DMA_TO_DEVICE) ) {}
 
-        RxBufferPtr = (float *) auxMatC + (i*4)*576;
-        XAxiDma_SimpleTransfer(&AxiDma[0],(UINTPTR) (RxBufferPtr),
-				    24*24*25*4, XAXIDMA_DEVICE_TO_DMA);
-        RxBufferPtr = (float *) auxMatC + (i*4+1)*576;
+
+        RxBufferPtr = (float *) auxMatC + (i*3)*576;
+        if(XAxiDma_SimpleTransfer(&AxiDma[0],(UINTPTR) (RxBufferPtr),
+				    24*24*4, XAXIDMA_DEVICE_TO_DMA)!=XST_SUCCESS)printf("fail\n");
+        RxBufferPtr = (float *) auxMatC + (i*3+1)*576;
         XAxiDma_SimpleTransfer(&AxiDma[1],(UINTPTR) (RxBufferPtr),
-				    24*24*25*4, XAXIDMA_DEVICE_TO_DMA);
-        RxBufferPtr = (float *) auxMatC + (i*4+2)*576;
+				    24*24*4, XAXIDMA_DEVICE_TO_DMA);
+        RxBufferPtr = (float *) auxMatC + (i*3+2)*576;
         XAxiDma_SimpleTransfer(&AxiDma[2],(UINTPTR) (RxBufferPtr),
-				    24*24*25*4, XAXIDMA_DEVICE_TO_DMA);
-        RxBufferPtr = (float *) auxMatC + (i*4+3)*576;
-        XAxiDma_SimpleTransfer(&AxiDma[3],(UINTPTR) (RxBufferPtr),
-				    24*24*25*4, XAXIDMA_DEVICE_TO_DMA);
+				    24*24*4, XAXIDMA_DEVICE_TO_DMA);
+
 
         TxBufferPtr = (float *) matA;
-        XAxiDma_SimpleTransfer(&AxiDma[0],(UINTPTR) TxBufferPtr,
-				    24*24*25, XAXIDMA_DMA_TO_DEVICE);
+        if(XAxiDma_SimpleTransfer(&AxiDma[0],(UINTPTR) TxBufferPtr,
+				    24*24*25*4, XAXIDMA_DMA_TO_DEVICE)!=XST_SUCCESS)printf("fail\n");
         XAxiDma_SimpleTransfer(&AxiDma[1],(UINTPTR) TxBufferPtr,
-				    24*24*25, XAXIDMA_DMA_TO_DEVICE);
+				    24*24*25*4, XAXIDMA_DMA_TO_DEVICE);
         XAxiDma_SimpleTransfer(&AxiDma[2],(UINTPTR) TxBufferPtr,
-				    24*24*25, XAXIDMA_DMA_TO_DEVICE);
-        XAxiDma_SimpleTransfer(&AxiDma[3],(UINTPTR) TxBufferPtr,
-				    24*24*25, XAXIDMA_DMA_TO_DEVICE);
+				    24*24*25*4, XAXIDMA_DMA_TO_DEVICE);
 
         /* Wait for Tx*/ 
         while ( XAxiDma_Busy(&AxiDma[0], XAXIDMA_DMA_TO_DEVICE) ||
                 XAxiDma_Busy(&AxiDma[1], XAXIDMA_DMA_TO_DEVICE) ||
-                XAxiDma_Busy(&AxiDma[2], XAXIDMA_DMA_TO_DEVICE) ||
-                XAxiDma_Busy(&AxiDma[3], XAXIDMA_DMA_TO_DEVICE) ) {}
+                XAxiDma_Busy(&AxiDma[2], XAXIDMA_DMA_TO_DEVICE) ) {}
 
         /* Wait for Rx*/ 
         while ( XAxiDma_Busy(&AxiDma[0], XAXIDMA_DEVICE_TO_DMA) ||
                 XAxiDma_Busy(&AxiDma[1], XAXIDMA_DEVICE_TO_DMA) ||
-                XAxiDma_Busy(&AxiDma[2], XAXIDMA_DEVICE_TO_DMA) ||
-                XAxiDma_Busy(&AxiDma[3], XAXIDMA_DEVICE_TO_DMA) ) {}
+                XAxiDma_Busy(&AxiDma[2], XAXIDMA_DEVICE_TO_DMA) ) {}
  
     }
 
-    TxBufferPtr = (float *) matB + 20*25;
+    TxBufferPtr = (float *) matB + 21*25;
     XAxiDma_SimpleTransfer(&AxiDma[0],(UINTPTR) TxBufferPtr,
                 100, XAXIDMA_DMA_TO_DEVICE);
-    TxBufferPtr = (float *) matB + 21*25;
-    XAxiDma_SimpleTransfer(&AxiDma[1],(UINTPTR) TxBufferPtr,
-                100, XAXIDMA_DMA_TO_DEVICE);
+
 
     /* Wait for Tx*/ 
-    while ( XAxiDma_Busy(&AxiDma[0], XAXIDMA_DMA_TO_DEVICE) ||
-            XAxiDma_Busy(&AxiDma[1], XAXIDMA_DMA_TO_DEVICE)) {}
+    while ( XAxiDma_Busy(&AxiDma[0], XAXIDMA_DMA_TO_DEVICE)) {}
 
-    RxBufferPtr = (float *) auxMatC + (20)*576;
-    XAxiDma_SimpleTransfer(&AxiDma[0],(UINTPTR) (RxBufferPtr),
-                24*24*25*4, XAXIDMA_DEVICE_TO_DMA);
     RxBufferPtr = (float *) auxMatC + (21)*576;
-    XAxiDma_SimpleTransfer(&AxiDma[1],(UINTPTR) (RxBufferPtr),
+    XAxiDma_SimpleTransfer(&AxiDma[0],(UINTPTR) (RxBufferPtr),
                 24*24*25*4, XAXIDMA_DEVICE_TO_DMA);
 
     TxBufferPtr = (float *) matA;
     XAxiDma_SimpleTransfer(&AxiDma[0],(UINTPTR) TxBufferPtr,
                 24*24*25, XAXIDMA_DMA_TO_DEVICE);
-    XAxiDma_SimpleTransfer(&AxiDma[1],(UINTPTR) TxBufferPtr,
-                24*24*25, XAXIDMA_DMA_TO_DEVICE);
 
     /* Wait for Tx*/ 
-    while ( XAxiDma_Busy(&AxiDma[0], XAXIDMA_DMA_TO_DEVICE) ||
-            XAxiDma_Busy(&AxiDma[1], XAXIDMA_DMA_TO_DEVICE)) {}
+    while ( XAxiDma_Busy(&AxiDma[0], XAXIDMA_DMA_TO_DEVICE)) {}
     /* Wait for Rx*/ 
-    while ( XAxiDma_Busy(&AxiDma[0], XAXIDMA_DEVICE_TO_DMA) ||
-            XAxiDma_Busy(&AxiDma[1], XAXIDMA_DEVICE_TO_DMA)) {}
+    while ( XAxiDma_Busy(&AxiDma[0], XAXIDMA_DEVICE_TO_DMA)) {}
 
-    Xil_DCacheInvalidateRange((INTPTR)(auxMatC), (unsigned)(24*24*22));
+    Xil_DCacheInvalidateRange((INTPTR)(auxMatC), (unsigned)(4*24*24*22));
     
 
     transpose(auxMatC,  22, 576 , (float *)matC);
@@ -660,6 +639,7 @@ void forward_convolutional_layer_HARDWARE()
     
 
 }
+
 #endif
 
 
@@ -702,26 +682,27 @@ void forward_connected_layer2()
     matOutB = (float *)matConnB;
 
     float *aux2,*aux3;
+    prepare_sub_matrices();
 
-    for(int it = 0; it < 40; it++) aux[it] = 0;
+    for(int it = 0; it < 60; it++) aux[it] = 0;
     for(int it = 0; it < 10; it++) matOUT[it] = 0;
 
-    aux2 = (float *)subMatsWeights+7920*0;
-    aux3 = (float *)matIN + 792*0;
-    gemm(aux2, aux3, (float *)aux, 10, 792, 1);
-    for(int it = 0; it < 10; it++) matOUT[it] += aux[it];
-    aux2 = (float *)subMatsWeights+7920*1;
-    aux3 = (float *)matIN + 792*1;
-    gemm(aux2, aux3, (float *)aux, 10, 792, 1);
-    for(int it = 0; it < 10; it++) matOUT[it] += aux[it];
-    aux2 = (float *)subMatsWeights+7920*2;
-    aux3 = (float *)matIN + 792*2;
-    gemm(aux2, aux3, (float *)aux, 10, 792, 1);
-    for(int it = 0; it < 10; it++) matOUT[it] += aux[it];
-    aux2 = (float *)subMatsWeights+7920*3;
-    aux3 = (float *)matIN + 792*3;
-    gemm(aux2, aux3, (float *)aux, 10, 792, 1);
-    for(int it = 0; it < 10; it++) matOUT[it] += aux[it];
+    for(int i = 0; i<2; i++) {
+    	printf("u\n");
+		aux2 = (float *)subMatsWeights+5280*(i*3);
+		aux3 = (float *)matIN + 528*(i*3);
+		gemm(aux2, aux3, (float *)aux, 10, 528, 1);
+		for(int it = 0; it < 10; it++) matOUT[it] += aux[it];
+		aux2 = (float *)subMatsWeights+5280*(i*3+1);
+		aux3 = (float *)matIN + 528*(i*3+1);
+		gemm(aux2, aux3, (float *)aux, 10, 528, 1);
+		for(int it = 0; it < 10; it++) matOUT[it] += aux[it];
+		aux2 = (float *)subMatsWeights+5280*(i*3+2);
+		aux3 = (float *)matIN + 528*(i*3+2);
+		gemm(aux2, aux3, (float *)aux, 10, 528, 1);
+		for(int it = 0; it < 10; it++) matOUT[it] += aux[it];
+    }
+
     
     // A(10*3168) * B(3168*1) -> C(10*1)
     //gemm(matW, matIN, matOUT, 10, 3168, 1);
@@ -739,96 +720,78 @@ void forward_connected_layer_HARDWARE()
     float *matIN, *mbias, *matOUT, *matOutB;
     float *TxBufferPtr, *RxBufferPtr;
 
-    // The 10 bias values of this layer are stored after the 22+550 convolutional bias+weigths
     mbias = (float *)fp_weights + 22 + 550;
-    // The 10*2880 weights are stored after the 10 bias values
-    // float *matW = (float *)fp_weights + 22 + 550 + 10;
     
     matIN = (float *)matCpool;
     matOUT = (float *)matConn;
     matOutB = (float *)matConnB;
 
-    float *aux2,*aux3;
+    //float *aux2,*aux3;
+    prepare_sub_matrices();
 
-    for(int it = 0; it < 40; it++) aux[it] = 0;
+    for(int it = 0; it < 60; it++) aux[it] = 0;
     for(int it = 0; it < 10; it++) matOUT[it] = 0;
 
-    Xil_DCacheFlushRange((INTPTR)(matIN), (unsigned)(12*12*22));
-    Xil_DCacheFlushRange((INTPTR)(subMatsWeights), (unsigned)(12*12*22*10));
+    Xil_DCacheFlushRange((INTPTR)(aux), (unsigned)(60*4));
+    Xil_DCacheFlushRange((INTPTR)(matIN), (unsigned)(12*12*22*4));
+    Xil_DCacheFlushRange((INTPTR)(subMatsWeights), (unsigned)(12*12*22*10*4));
 
-    TxBufferPtr = (float *) matIN;
-    XAxiDma_SimpleTransfer(&AxiDma[0],(UINTPTR) TxBufferPtr,
-                792, XAXIDMA_DMA_TO_DEVICE);
-    TxBufferPtr = (float *) matIN+1*792;
-    XAxiDma_SimpleTransfer(&AxiDma[1],(UINTPTR) TxBufferPtr,
-                792, XAXIDMA_DMA_TO_DEVICE);
-    TxBufferPtr = (float *) matIN+2*792;
-    XAxiDma_SimpleTransfer(&AxiDma[2],(UINTPTR) TxBufferPtr,
-                792, XAXIDMA_DMA_TO_DEVICE);
-    TxBufferPtr = (float *) matIN+3*792;
-    XAxiDma_SimpleTransfer(&AxiDma[3],(UINTPTR) TxBufferPtr,
-                792, XAXIDMA_DMA_TO_DEVICE);
+    for(int i=0; i<2; i++){
+		TxBufferPtr = (float *) matIN+i*3*528;
+		if(XAxiDma_SimpleTransfer(&AxiDma[0],(UINTPTR) TxBufferPtr,
+					528*4, XAXIDMA_DMA_TO_DEVICE)!=XST_SUCCESS) printf("fail\n");
+		TxBufferPtr = (float *) matIN+(i*3+1)*528;
+		XAxiDma_SimpleTransfer(&AxiDma[1],(UINTPTR) TxBufferPtr,
+					528*4, XAXIDMA_DMA_TO_DEVICE);
+		TxBufferPtr = (float *) matIN+(i*3+2)*528;
+		XAxiDma_SimpleTransfer(&AxiDma[2],(UINTPTR) TxBufferPtr,
+					528*4, XAXIDMA_DMA_TO_DEVICE);
 
-    /* Wait for Tx*/ 
-    while ( XAxiDma_Busy(&AxiDma[0], XAXIDMA_DMA_TO_DEVICE) ||
-            XAxiDma_Busy(&AxiDma[1], XAXIDMA_DMA_TO_DEVICE) ||
-            XAxiDma_Busy(&AxiDma[2], XAXIDMA_DMA_TO_DEVICE) ||
-            XAxiDma_Busy(&AxiDma[3], XAXIDMA_DMA_TO_DEVICE) ) {}
+		/* Wait for Tx*/
+		while ( XAxiDma_Busy(&AxiDma[0], XAXIDMA_DMA_TO_DEVICE) ||
+				XAxiDma_Busy(&AxiDma[1], XAXIDMA_DMA_TO_DEVICE) ||
+				XAxiDma_Busy(&AxiDma[2], XAXIDMA_DMA_TO_DEVICE) ) {}
 
-    RxBufferPtr = (float *) aux;
-    XAxiDma_SimpleTransfer(&AxiDma[0],(UINTPTR) (RxBufferPtr),
-                10, XAXIDMA_DEVICE_TO_DMA);
-    RxBufferPtr = (float *) aux+1*10;
-    XAxiDma_SimpleTransfer(&AxiDma[1],(UINTPTR) (RxBufferPtr),
-                10, XAXIDMA_DEVICE_TO_DMA);
-    RxBufferPtr = (float *) aux+2*10;
-    XAxiDma_SimpleTransfer(&AxiDma[2],(UINTPTR) (RxBufferPtr),
-                10, XAXIDMA_DEVICE_TO_DMA);
-    RxBufferPtr = (float *) aux+3*10;
-    XAxiDma_SimpleTransfer(&AxiDma[3],(UINTPTR) (RxBufferPtr),
-                10, XAXIDMA_DEVICE_TO_DMA);
+		RxBufferPtr = (float *) aux+i*3*10;
+		if(XAxiDma_SimpleTransfer(&AxiDma[0],(UINTPTR) (RxBufferPtr),
+					10*4, XAXIDMA_DEVICE_TO_DMA)!=XST_SUCCESS) printf("fail\n");
+		RxBufferPtr = (float *) aux+(i*3+1)*10;
+		XAxiDma_SimpleTransfer(&AxiDma[1],(UINTPTR) (RxBufferPtr),
+					10*4, XAXIDMA_DEVICE_TO_DMA);
+		RxBufferPtr = (float *) aux+(i*3+2)*10;
+		XAxiDma_SimpleTransfer(&AxiDma[2],(UINTPTR) (RxBufferPtr),
+					10*4, XAXIDMA_DEVICE_TO_DMA);
 
-    TxBufferPtr = (float *) subMatsWeights;
-    XAxiDma_SimpleTransfer(&AxiDma[0],(UINTPTR) TxBufferPtr,
-                7920, XAXIDMA_DMA_TO_DEVICE);
-    TxBufferPtr = (float *) subMatsWeights+1*7920;
-    XAxiDma_SimpleTransfer(&AxiDma[1],(UINTPTR) TxBufferPtr,
-                7920, XAXIDMA_DMA_TO_DEVICE);
-    TxBufferPtr = (float *) subMatsWeights+2*7920;
-    XAxiDma_SimpleTransfer(&AxiDma[2],(UINTPTR) TxBufferPtr,
-                7920, XAXIDMA_DMA_TO_DEVICE);
-    TxBufferPtr = (float *) subMatsWeights+3*7920;
-    XAxiDma_SimpleTransfer(&AxiDma[3],(UINTPTR) TxBufferPtr,
-                7920, XAXIDMA_DMA_TO_DEVICE);
+		TxBufferPtr = (float *) subMatsWeights+i*3*5280;
+		if(XAxiDma_SimpleTransfer(&AxiDma[0],(UINTPTR) TxBufferPtr,
+					5280*4, XAXIDMA_DMA_TO_DEVICE)!=XST_SUCCESS) printf("fail\n");
+		TxBufferPtr = (float *) subMatsWeights+(i*3+1)*5280;
+		XAxiDma_SimpleTransfer(&AxiDma[1],(UINTPTR) TxBufferPtr,
+					5280*4, XAXIDMA_DMA_TO_DEVICE);
+		TxBufferPtr = (float *) subMatsWeights+(i*3+2)*5280;
+		XAxiDma_SimpleTransfer(&AxiDma[2],(UINTPTR) TxBufferPtr,
+					5280*4, XAXIDMA_DMA_TO_DEVICE);
 
-    /* Wait for Tx*/ 
-    while ( XAxiDma_Busy(&AxiDma[0], XAXIDMA_DMA_TO_DEVICE) ||
-            XAxiDma_Busy(&AxiDma[1], XAXIDMA_DMA_TO_DEVICE) ||
-            XAxiDma_Busy(&AxiDma[2], XAXIDMA_DMA_TO_DEVICE) ||
-            XAxiDma_Busy(&AxiDma[3], XAXIDMA_DMA_TO_DEVICE) ) {}
+		/* Wait for Tx*/
+		while ( XAxiDma_Busy(&AxiDma[0], XAXIDMA_DMA_TO_DEVICE) ||
+				XAxiDma_Busy(&AxiDma[1], XAXIDMA_DMA_TO_DEVICE) ||
+				XAxiDma_Busy(&AxiDma[2], XAXIDMA_DMA_TO_DEVICE) ) {}
 
-    /* Wait for Rx*/ 
-    while ( XAxiDma_Busy(&AxiDma[0], XAXIDMA_DEVICE_TO_DMA) ||
-            XAxiDma_Busy(&AxiDma[1], XAXIDMA_DEVICE_TO_DMA) ||
-            XAxiDma_Busy(&AxiDma[2], XAXIDMA_DEVICE_TO_DMA) ||
-            XAxiDma_Busy(&AxiDma[3], XAXIDMA_DEVICE_TO_DMA) ) {}
+		/* Wait for Rx*/
+		while ( XAxiDma_Busy(&AxiDma[0], XAXIDMA_DEVICE_TO_DMA) ||
+				XAxiDma_Busy(&AxiDma[1], XAXIDMA_DEVICE_TO_DMA) ||
+				XAxiDma_Busy(&AxiDma[2], XAXIDMA_DEVICE_TO_DMA) ) {}
+
+    }
+
+    Xil_DCacheInvalidateRange((INTPTR)(aux), (unsigned)(60*4));
+
+    for(int it = 0; it < 10; it++)
+    	matOUT[it] += aux[it] + aux[it+10] + aux[it+20] + aux[it+30] + aux[it+40] + aux[it+50];
 
 
-
-    Xil_DCacheInvalidateRange((INTPTR)(aux), (unsigned)(40));
-
-    for(int k=0; k<4; k++)
-        for(int it = 0; it < 10; it++) matOUT[it] += aux[it];
-
-    
-    // A(10*3168) * B(3168*1) -> C(10*1)
-    //gemm(matW, matIN, matOUT, 10, 3168, 1);
-    // print_fp((float *)matConn, 10, "Connected");
-    // print_fp(mbias, 10, "Bias");
-        
     add_bias(matOUT, 10, 1, mbias, (float *)matOutB, 0);
-    // print_fp((float *)matConnB, 10, "Connected+Bias");
-    // Output vector ConnB has 10 values, one for each digit
+
 }
 #endif
 
@@ -864,7 +827,7 @@ int predict_mnist()
 #endif
 
 	measure_time(3);
-#if USEDUALCORE
+#if 0
 	forward_softmax_layer_2core();
 #else
 	best = forward_softmax_layer();
@@ -964,13 +927,20 @@ static float *paddress = (float *)MEM_DATA_BASE_ADDRESS;
     paddress += 3168;
     // Aux array of 40 elements. Region size = 40 * 4 Bytes
     aux = paddress;
-    paddress += 40;
+    paddress += 60;
     // Aux floats for sums
     sum1 = paddress;
     paddress += 1;
     sum2 = paddress;
     paddress += 1;
+    auxMatC = paddress;
+    paddress += 24*24*22;
 
+#if USEDUALCORE
+    //sync_f = (int*)paddress;
+#endif
+
+    //printf("%p\n",paddress);
 
 	// printf("%p, %d\n", (void *)paddress+10, (paddress+10)-(float *)MEM_DATA_BASE_ADDRESS);
 	// Total data region size is 71898 * 4 = 287,592 Bytes
@@ -999,6 +969,7 @@ double *measure_time(int count)
 }
 
 // Only used for PC execution
+#if EMBEDDED == 0
 void upload_images_and_weights(void *pim, void *pwe, int size_im, int size_we)
 {
 	char header[16];
@@ -1023,6 +994,7 @@ void upload_images_and_weights(void *pim, void *pwe, int size_im, int size_we)
 	fclose(fimages);
 	fclose(fweights);
 }
+#endif
 
 int main(int argc, char **argv)
 {
@@ -1038,13 +1010,18 @@ int main(int argc, char **argv)
 
 #if USEDUALCORE
 	Xil_SetTlbAttributes(0xFFFFFC00,0x14de2);
+    *sync_f = ZERO_STARTED;
+    printf("Zero started!\n");
+    while(*sync_f != ONE_STARTED){}
+    printf("One started!\n");
 #endif
+
 	
 #if EMBEDDED == 0
 	upload_images_and_weights((void *)ch_images, (void *)fp_weights, 
 					16+NIMAGES*IMAGE_HEIGTH*IMAGE_WIDTH, TOTAL_WEIGTHS); // Only used for PC execution
 #endif
-	
+
 	for (image_to_classify = IMAGE_TO_CLASSIFY;
 			image_to_classify < (IMAGE_TO_CLASSIFY+NUMBER_OF_IMAGES_TO_CLASSIFY);
 			image_to_classify++) {
@@ -1055,8 +1032,6 @@ int main(int argc, char **argv)
 #if PRINT_IMAGE
 		print_pgm((unsigned char *)ch_images, image_to_classify);
 #endif
-
-
 
         prediction = predict_mnist();
 

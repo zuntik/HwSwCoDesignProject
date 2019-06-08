@@ -1,29 +1,16 @@
 #include <stdlib.h>
 #include <stdio.h>
+#if 0
 #include <math.h>
-#include "image.h"
-#include "simple_cnn.h"
-
-#if USEHARDWARE
-#include "xaxidma.h"
-#include "xparameters.h"
-#include "xtime_l.h"
-#include "xil_cache.h"
-#define DMA_DEV_ID0		XPAR_AXIDMA_0_DEVICE_ID
-#define DMA_DEV_ID1		XPAR_AXIDMA_1_DEVICE_ID
-#define DMA_DEV_ID2		XPAR_AXIDMA_2_DEVICE_ID
-#define DMA_DEV_ID3		XPAR_AXIDMA_3_DEVICE_ID
 #endif
-
-#if USEDUALCORE
+#include "core1.h"
 #include "xil_mmu.h"
-#endif
+#include "xil_cache.h"
 
 
-
-#if USEHARDWARE
-XAxiDma AxiDma[4];
-#endif
+#define NIMAGES 100
+#define IMAGE_HEIGTH 28
+#define IMAGE_WIDTH 28
 
 volatile int *sync_f = (int *)0xFFFFFC00;
 volatile float *sum1, *sum2;
@@ -48,37 +35,36 @@ volatile float *matSoftM; // Output of softmax layer (10 elements)
 
 volatile float *subMatsWeights; // Auxiliary matrix for 3rd layer
 volatile float *aux; // Auxiliary array for 
+volatile float *auxMatC;
 
 
 
+#if 0
 int forward_softmax_layer_2core()
 {
 	int i, n=10, best=-1;
 	float e;
 	float largest = -FLT_MAX;
 
-    // Finding the biggest element should be done by core 1
-	for(i = 0; i < n; ++i){
-		if(matConnB[i] > largest) {
-			largest = matConnB[i];
-			best = i;
-		}
-	}
-	
-    // only the exponentiation should be distributed
+
+    while(*sync_f != DO_FORTH_LAYER){}
     
+
     // place in core 1
+	*sum2 = 0;
 	for(i = 5; i < 10; ++i){
 		e = exp(matConnB[i]);
-		*sum1 += e;
+		*sum2 += e;
 		matSoftM[i] = e;
 	}
+
+	*sync_f = FORTH_LAYER_DONE;
 
 	//print_fp((float *)matSoftM, 10, "Softmax");
 
 	return best;
 }
-
+#endif
 
 
 void forward_maxpool_layer_2core()
@@ -86,15 +72,18 @@ void forward_maxpool_layer_2core()
 	int i, j, k, n, m, row, col, index;
 	int size=2, stride=2;
 	int oh=12, ow=12;
-	int ih=24, iw=24, chan=22;
+	int ih=24, iw=24;
 	float max = -FLT_MAX, val;
 	float *pout, *pin;
 
 	pin = (float *)matCbias;
 	pout = (float *)matCpool;
 	
+	// we wait do to stuff
+	while(*sync_f != DO_SECOND_LAYER){}
+
     // second half
-	for(k = 11; k < chan; ++k){
+	for(k = 11; k < 22; ++k){
 		for(i = 0; i < oh; ++i) {
 			for(j = 0; j < ow; ++j) {
 	            max = -FLT_MAX;
@@ -111,6 +100,11 @@ void forward_maxpool_layer_2core()
 			}
 		}
 	}
+
+    Xil_DCacheFlushRange((INTPTR)(matB+25*11), (unsigned)(4*25*11));
+
+
+	*sync_f = SECOND_LAYER_DONE;
 
 	// print_fp((float *)matCpool, 120, "Pool");
 	// Output matrix Cpool is 22*144, that is this layer outputs 22 12*12 images.
@@ -167,12 +161,20 @@ static float *paddress = (float *)MEM_DATA_BASE_ADDRESS;
     paddress += 3168;
     // Aux array of 40 elements. Region size = 40 * 4 Bytes
     aux = paddress;
-    paddress += 40;
+    paddress += 60;
     // Aux floats for sums
     sum1 = paddress;
     paddress += 1;
     sum2 = paddress;
     paddress += 1;
+    auxMatC = paddress;
+    paddress += 24*24*22;
+
+
+    //sync_f = (int*)paddress;
+
+    //printf("%p\n",paddress);
+
 
 	// printf("%p, %d\n", (void *)paddress+10, (paddress+10)-(float *)MEM_DATA_BASE_ADDRESS);
 	// Total data region size is 71898 * 4 = 287,592 Bytes
@@ -187,21 +189,15 @@ int main(int argc, char **argv)
 
 	Xil_SetTlbAttributes(0xFFFFFC00,0x14de2);
 	
+	while(*sync_f != ZERO_STARTED) {}
+	*sync_f = ONE_STARTED;
+
+	printf("I, core 1, have started\n");
 	
-    while(true) {
-
-		// The pixels of the input image are scaled to the [0,1[ interval
-		image_scale2float((unsigned char *)ch_images, image_to_classify, (float *)fp_image);
-
-#if PRINT_IMAGE
-		print_pgm((unsigned char *)ch_images, image_to_classify);
-#endif
+    while(1) {
+    	forward_maxpool_layer_2core();
 
 
-
-        prediction = predict_mnist();
-
-		printf("Image %d -> Digit %d %f\n", image_to_classify, prediction, matSoftM[prediction]*100);
 	}
 
 }
